@@ -86,7 +86,7 @@ describe("InvoiceChecker", () => {
     });
   });
 
-  it("reports each unordered likely-transaction pair once, including zero totals", async () => {
+  it("reports one grouped likely-transaction issue, including zero totals", async () => {
     const invoice = await store.createInvoice({
       startDate: "2026-03-01",
       endDate: "2026-03-31",
@@ -96,6 +96,7 @@ describe("InvoiceChecker", () => {
       [
         row({ id: "a", date: "2026-03-10", groceriesMinor: 0, comment: "Café Market" }),
         row({ id: "b", date: "2026-03-10", groceriesMinor: 0, comment: "cafe-market!!" }),
+        row({ id: "e", date: "2026-03-10", groceriesMinor: 0, comment: " cafe market " }),
         row({ id: "c", date: null, groceriesMinor: 0, comment: "Cafe Market" }),
         row({ id: "d", date: "2026-03-10", groceriesMinor: 1, comment: "Cafe Market" }),
       ],
@@ -113,7 +114,7 @@ describe("InvoiceChecker", () => {
         code: "likely-transaction-duplicate",
         message:
           "These rows may describe the same transaction: merchant/comment, date, and total match.",
-        rowIds: ["a", "b"],
+        rowIds: ["a", "b", "e"],
         receiptIds: [],
       },
     ]);

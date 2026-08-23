@@ -43,10 +43,11 @@ Run `make help` at any time to see every supported command.
 3. Paste an OpenAI API key, click **Test Key**, and then **Save Key**.
 4. Optionally change the default hourly rate.
 5. Create an invoice and choose its inclusive start and end dates.
-6. Drop one or many receipt images/PDFs into the window, or click **Add Receipts** and select a batch with Command- or Shift-click.
-7. Review the scanned rows, edit any cells, and add hours as needed. Rows start in ascending Date order; click any user-column header to sort by that column.
-8. Click **Check Invoice** to review possible duplicates, scan warnings, incomplete rows, and dates outside the invoice period. Check off advisory findings after verifying them; retry or fix operational scan failures.
-9. Use **Copy TSV** for Google Sheets, then click **Build Output** when the client package is ready to send.
+6. Drop one or many receipt images/PDFs into the window, or click **Add Receipts** and select a batch with Command- or Shift-click. The app explains that automatic extraction uploads those receipt files to OpenAI before the first scan.
+7. The files are copied locally first, then scanned in the background. You can cancel the scan or work in another invoice while it runs; the invoice being scanned stays read-only until its final results are loaded.
+8. Review the scanned rows, edit any cells, and add hours as needed. Rows start in ascending Date order; click any user-column header to sort by that column.
+9. Click **Check Invoice** to review possible duplicates, scan warnings, incomplete rows, and dates outside the invoice period. Check off advisory findings after verifying them; retry or fix operational scan failures.
+10. Use **Copy Full Invoice** (or **Copy N Selected**) for Google Sheets. Choose **Build PDF Output** for the client PDF and receipt package, or **Export Spreadsheet…** for a TSV/CSV package.
 
 The saved API key is encrypted with Electron `safeStorage` before its ciphertext is written to the app's macOS Application Support directory. It is never written to the invoice folder, source tree, TSV/CSV files, or exports. Do not put API keys in this repository or in an `.env` file.
 
@@ -79,16 +80,17 @@ The saved API key is encrypted with Electron `safeStorage` before its ciphertext
 - Creates one date-range folder per invoice in any selected local directory.
 - Bulk imports JPEG, PNG, WebP, HEIC/HEIF, and ordinary unencrypted PDF receipts up to the 20 MB safe-processing limit.
 - Copies originals into the invoice and detects exact duplicates using SHA-256.
+- Makes an accepted batch durable in one local update, then scans up to two receipts concurrently in the background with visible progress and cancellation.
 - Extracts the merchant, transaction date, final total, and optional line items.
 - Provides an editable six-column grid: Date, Groceries MP, Hours Worked, Rate, Labour Total, and Comment.
 - Sorts all six user columns from their headers, with stable blanks-last ordering and ascending Date as the default.
 - Calculates groceries, hours, labour, and combined invoice totals exactly.
 - Keeps the component `Total` row and adds a final `Grand Total` row whose combined groceries-plus-labour amount appears in the `Labour Total` column.
 - Tracks each imported receipt as Manual plus its drag/drop or file-picker source.
-- Continuously writes `invoice.json`, `invoice.tsv`, and `invoice.csv` using atomic file updates.
+- Writes authoritative `invoice.json` plus spreadsheet views using atomic file updates. Opening an invoice is a pure read; a small revision marker lets the bounded startup pass repair TSV/CSV views only when an interrupted write left them stale.
 - Shows the managed receipt file path, source preview, itemization, validation warnings, and scan metadata on click.
 - Lets you pinch or use the preview controls to zoom images, then drag to pan around them.
-- Copies spreadsheet-ready TSV and exports client/debug folders or ZIP files.
+- Copies either the full invoice or selected rows as spreadsheet-ready TSV, and exports client/debug folders or ZIP files with bounded file I/O.
 - Builds an invoice-local `output/invoice.pdf` plus one receipt copy per unique SHA-256 under `output/receipts/`.
 - **Check Invoice** detects exact receipt duplicates, warns about likely duplicate transactions, surfaces completed-scan validation warnings, and highlights incomplete rows or dates outside the invoice's inclusive range.
 - Lets the user mark advisory findings reviewed while keeping receipt scan status unchanged. The acknowledgment is tied to the exact causal evidence, so a materially changed row or a new scan must be reviewed again.
@@ -101,7 +103,7 @@ Original input files are never moved, modified, or deleted.
 
 The receipt/incomplete category is deterministic rather than a model probability. A completed scan marked `needs-review` exposes its saved validation warnings as advisory checklist items. Operational states such as queued, scanning, needs-key, or error cannot be checked off; retry or fix those scans instead. Missing receipt links, required fields, possible duplicates, and out-of-period dates are advisory because a user may have valid reasons to keep them. Acknowledging a finding records review only: it does not change receipt status, edit fields, merge rows, or hide the finding. If the evidence that caused it changes, the old acknowledgment is ignored.
 
-**Check Invoice** is advisory and never gates **Build Output**, **Copy TSV**, or **Export**. Output creation still fails safely for hard managed-file integrity problems such as a missing receipt, a symbolic link, or a SHA-256 mismatch.
+**Check Invoice** is advisory and never gates **Build PDF Output**, the copy actions, or **Export Spreadsheet**. Output creation still fails safely for hard managed-file integrity problems such as a missing receipt, a symbolic link, or a SHA-256 mismatch.
 
 ### Sorting and saved order
 
@@ -117,6 +119,7 @@ The selected working folder is the database. Each invoice looks like this:
 invoice-2026-01-01-2026-01-31/
   invoice.json
   invoice.json.bak  # appears after the first update
+  .invoice-views.json  # crash-recovery state for the TSV/CSV views
   DELETED.json      # soft removal, or an interrupted permanent deletion
   invoice.tsv
   invoice.csv
@@ -130,6 +133,7 @@ invoice-2026-01-01-2026-01-31/
 
 - `invoice.json` is the authoritative editable state.
 - `invoice.tsv` and `invoice.csv` are regenerated views for spreadsheets.
+- `.invoice-views.json` records which authoritative revision produced the views, so stale or interrupted derived files can be repaired without rewriting them whenever an invoice opens.
 - `receipts/` contains managed copies of the source receipts.
 - `debug/` contains normalized extraction and optional itemization data.
 - `.trash/` supports safe row/receipt deletion and undo.
@@ -138,7 +142,7 @@ invoice-2026-01-01-2026-01-31/
 - `DELETED.json` is a portable deletion sentinel. When present, the app omits that invoice from the
   sidebar and will not silently reopen or recreate it.
 
-Building the client output reconstructs the complete `output/` directory and replaces the previous version only after the new build succeeds. Receipts removed from the invoice therefore cannot linger as stale client attachments. Editing, importing, rescanning, deleting, or restoring invoice data clears the in-app ready state; click **Build Output** again before sending. If a rebuild fails, the previous output remains intact. The build reads the invoice's managed receipt copies; original files selected from Dropbox or elsewhere are never changed, moved, or deleted.
+Building the client output reconstructs the complete `output/` directory and replaces the previous version only after the new build succeeds. Receipts removed from the invoice therefore cannot linger as stale client attachments. Editing, importing, rescanning, deleting, or restoring invoice data clears the in-app ready state; click **Build PDF Output** again before sending. If a rebuild fails, the previous output remains intact. The build reads the invoice's managed receipt copies; original files selected from Dropbox or elsewhere are never changed, moved, or deleted.
 
 Moving or backing up the complete working folder preserves the invoices. Dropbox may sync it like any other local folder, but the app does not connect to Dropbox itself.
 

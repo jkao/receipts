@@ -4,6 +4,7 @@ import {
   DEFAULT_INVOICE_SORT,
   normalizeInvoiceSort,
   rowsHaveSameOrder,
+  rowsNeedResort,
   sortInvoiceRows,
 } from "./invoiceSort";
 
@@ -102,6 +103,32 @@ describe("invoice row sorting", () => {
     const second = row("second");
     expect(rowsHaveSameOrder([first, second], [first, second])).toBe(true);
     expect(rowsHaveSameOrder([first, second], [second, first])).toBe(false);
+  });
+
+  it("skips sorting when an edit does not affect the active sort value", () => {
+    const original = [row("first", { date: "2026-06-01" }), row("second")];
+    const commentEdit = [{ ...original[0], comment: "Updated" }, original[1]];
+    const dateEdit = [{ ...original[0], date: "2026-06-30" }, original[1]];
+
+    expect(rowsNeedResort(original, commentEdit, DEFAULT_INVOICE_SORT)).toBe(false);
+    expect(rowsNeedResort(original, dateEdit, DEFAULT_INVOICE_SORT)).toBe(true);
+    expect(rowsNeedResort(original, [...original, row("third")], DEFAULT_INVOICE_SORT)).toBe(true);
+  });
+
+  it("accounts for displayed and computed dependencies of the active sort", () => {
+    const original = [row("first", { hours: "", rateMinor: 4_500 })];
+    const rateOnly = [row("first", { hours: "", rateMinor: 9_000 })];
+    const withHours = [row("first", { hours: "2", rateMinor: 4_500 })];
+
+    expect(rowsNeedResort(original, rateOnly, [{ columnKey: "rateMinor", direction: "ASC" }])).toBe(
+      false
+    );
+    expect(
+      rowsNeedResort(original, withHours, [{ columnKey: "rateMinor", direction: "ASC" }])
+    ).toBe(true);
+    expect(
+      rowsNeedResort(original, withHours, [{ columnKey: "labourTotal", direction: "ASC" }])
+    ).toBe(true);
   });
 
   it("keeps temporarily invalid or overflowing edited numbers at the bottom", () => {

@@ -1,5 +1,6 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type {
+  DesktopApi,
   InvoiceCheckIssue,
   InvoiceRow,
   ReceiptDebug,
@@ -13,6 +14,7 @@ import { ReviewChecklistItem } from "./ReviewChecklistItem";
 
 interface ReceiptDrawerProps {
   invoiceId: string;
+  resourceGeneration: number;
   row: InvoiceRow;
   receipt: ReceiptRecord | null;
   reviewDisabled: boolean;
@@ -27,8 +29,60 @@ function valueOrDash(value: string | null | undefined): string {
   return value?.trim() || "—";
 }
 
+type ReceiptResourceApi = Pick<
+  DesktopApi,
+  "getReceiptPreview" | "releaseReceiptPreview" | "getReceiptDebug"
+>;
+
+interface ReceiptResourceCallbacks {
+  onPreview: (preview: ReceiptPreview) => void;
+  onPreviewError: (error: unknown) => void;
+  onPreviewSettled: () => void;
+  onDebug: (debug: ReceiptDebug | null) => void;
+  onDebugError: (error: unknown) => void;
+  onDebugSettled: () => void;
+}
+
+/** Start the two independent drawer reads and return their lifecycle cleanup. */
+export function startReceiptResourceLoad(
+  api: ReceiptResourceApi,
+  invoiceId: string,
+  receiptId: string,
+  callbacks: ReceiptResourceCallbacks
+): () => void {
+  let active = true;
+  void api
+    .getReceiptPreview(invoiceId, receiptId)
+    .then((preview) => {
+      if (active) callbacks.onPreview(preview);
+    })
+    .catch((error) => {
+      if (active) callbacks.onPreviewError(error);
+    })
+    .finally(() => {
+      if (active) callbacks.onPreviewSettled();
+    });
+  void api
+    .getReceiptDebug(invoiceId, receiptId)
+    .then((debug) => {
+      if (active) callbacks.onDebug(debug);
+    })
+    .catch((error) => {
+      if (active) callbacks.onDebugError(error);
+    })
+    .finally(() => {
+      if (active) callbacks.onDebugSettled();
+    });
+
+  return () => {
+    active = false;
+    api.releaseReceiptPreview();
+  };
+}
+
 export function ReceiptDrawer({
   invoiceId,
+  resourceGeneration,
   row,
   receipt,
   reviewDisabled,
@@ -42,22 +96,36 @@ export function ReceiptDrawer({
   const drawerTitleId = useId();
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const onCloseRef = useRef(onClose);
-  const [preview, setPreview] = useState<ReceiptPreview | null>(null);
-  const [debug, setDebug] = useState<ReceiptDebug | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
-  const [debugLoading, setDebugLoading] = useState(false);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [debugError, setDebugError] = useState<string | null>(null);
+  const [loadedPreview, setPreview] = useState<ReceiptPreview | null>(null);
+  const [loadedDebug, setDebug] = useState<ReceiptDebug | null>(null);
+  const [loadedPreviewLoading, setPreviewLoading] = useState(false);
+  const [loadedDebugLoading, setDebugLoading] = useState(false);
+  const [loadedPreviewError, setPreviewError] = useState<string | null>(null);
+  const [loadedDebugError, setDebugError] = useState<string | null>(null);
+  const [loadedResourceKey, setLoadedResourceKey] = useState<string | null>(null);
   const unresolvedReviewCount = reviewIssues.filter(
     (issue) => issue.acknowledgedAt === null
   ).length;
-  const previewKind = preview ? receiptPreviewKind(preview) : null;
   const receiptId = receipt?.id ?? null;
   const receiptStatus = receipt?.status ?? null;
+  const resourceKey = `${invoiceId}:${resourceGeneration}:${receiptId ?? "manual"}:${receiptStatus ?? "none"}`;
+  const resourcesAreCurrent = loadedResourceKey === resourceKey;
+  const preview = resourcesAreCurrent ? loadedPreview : null;
+  const debug = resourcesAreCurrent ? loadedDebug : null;
+  const previewLoading = resourcesAreCurrent ? loadedPreviewLoading : Boolean(receiptId);
+  const debugLoading = resourcesAreCurrent ? loadedDebugLoading : Boolean(receiptId);
+  const previewError = resourcesAreCurrent ? loadedPreviewError : null;
+  const debugError = resourcesAreCurrent ? loadedDebugError : null;
+  const previewKind = preview ? receiptPreviewKind(preview) : null;
 
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
+
+  const closeDrawer = useCallback(() => {
+    window.receiptApp.releaseReceiptPreview();
+    onCloseRef.current();
+  }, []);
 
   useEffect(() => {
     const previouslyFocused =
@@ -72,53 +140,37 @@ export function ReceiptDrawer({
         return;
       }
       event.preventDefault();
-      onCloseRef.current();
+      closeDrawer();
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       previouslyFocused?.focus();
     };
-  }, []);
+  }, [closeDrawer]);
 
   useEffect(() => {
+    setLoadedResourceKey(resourceKey);
     setPreview(null);
     setDebug(null);
     setPreviewError(null);
     setDebugError(null);
     setPreviewLoading(Boolean(receiptId));
     setDebugLoading(Boolean(receiptId));
-    if (!receiptId || !receiptStatus) return;
+    if (!receiptId || !receiptStatus) {
+      window.receiptApp.releaseReceiptPreview();
+      return;
+    }
 
-    let cancelled = false;
-    void window.receiptApp
-      .getReceiptPreview(invoiceId, receiptId)
-      .then((result) => {
-        if (cancelled) return;
-        setPreview(result);
-      })
-      .catch((error) => {
-        if (!cancelled) setPreviewError(messageFromError(error));
-      })
-      .finally(() => {
-        if (!cancelled) setPreviewLoading(false);
-      });
-    void window.receiptApp
-      .getReceiptDebug(invoiceId, receiptId)
-      .then((result) => {
-        if (!cancelled) setDebug(result);
-      })
-      .catch((error) => {
-        if (!cancelled) setDebugError(messageFromError(error));
-      })
-      .finally(() => {
-        if (!cancelled) setDebugLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [invoiceId, receiptId, receiptStatus]);
+    return startReceiptResourceLoad(window.receiptApp, invoiceId, receiptId, {
+      onPreview: setPreview,
+      onPreviewError: (error) => setPreviewError(messageFromError(error)),
+      onPreviewSettled: () => setPreviewLoading(false),
+      onDebug: setDebug,
+      onDebugError: (error) => setDebugError(messageFromError(error)),
+      onDebugSettled: () => setDebugLoading(false),
+    });
+  }, [invoiceId, receiptId, receiptStatus, resourceKey]);
 
   return (
     <aside aria-labelledby={drawerTitleId} className="receipt-drawer">
@@ -132,7 +184,7 @@ export function ReceiptDrawer({
           aria-label="Close row details"
           className="icon-button"
           type="button"
-          onClick={onClose}
+          onClick={closeDrawer}
         >
           ×
         </button>
@@ -236,6 +288,7 @@ export function ReceiptDrawer({
                   filename={preview.filename}
                   src={preview.dataUrl}
                   onError={() => {
+                    window.receiptApp.releaseReceiptPreview();
                     setPreview(null);
                     setPreviewError("This receipt preview could not be displayed.");
                   }}

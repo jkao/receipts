@@ -1,0 +1,201 @@
+@media (max-width: 1180px) {
+  .app-shell {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .workspace-header,
+  .toolbar {
+    padding-right: 20px;
+    padding-left: 20px;
+  }
+
+  .grid-panel,
+  .import-progress,
+  .invoice-check,
+  .output-ready {
+    margin-right: 20px;
+    margin-left: 20px;
+  }
+
+  .invoice-check-groups {
+    grid-template-columns: 1fr;
+  }
+
+  .output-ready-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .output-ready-actions {
+    justify-content: flex-start;
+  }
+
+  .output-ready-path {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspace-summary > div:not(.workspace-summary-total) {
+    display: none;
+  }
+
+  .toolbar {
+    align-items: flex-start;
+  }
+
+  .toolbar-primary,
+  .toolbar-secondary {
+    width: 100%;
+    justify-content: flex-start;
+    margin-left: 0;
+  }
+
+  .app-shell:has(.receipt-drawer) .workspace {
+    margin-right: 0;
+  }
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar {
+    display: flex;
+    min-height: 62px;
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-right: 0;
+    border-bottom: 1px solid #d6d3cc;
+    overflow-x: auto;
+  }
+
+  .brand {
+    flex: 0 0 auto;
+    padding: 0;
+  }
+
+  .brand > div,
+  .sidebar-heading {
+    display: none;
+  }
+
+  .brand-mark {
+    width: 32px;
+    height: 32px;
+  }
+
+  .new-invoice-button,
+  .settings-button {
+    width: auto;
+    min-height: 36px;
+    flex: 0 0 auto;
+    padding-inline: 10px;
+  }
+
+  .invoice-list {
+    display: flex;
+    min-width: 140px;
+    gap: 4px;
+    overflow-x: auto;
+  }
+
+  .invoice-list-item {
+    width: auto;
+    min-width: 132px;
+    margin: 0;
+    padding: 8px 9px;
+  }
+
+  .invoice-list-item > span,
+  .invoice-list-item small {
+    display: none;
+  }
+
+  /* biome-ignore lint/style/noDescendingSpecificity: This narrow-layout flex rule is independent of the medium-layout drawer margin override. */
+  .workspace {
+    flex: 1;
+  }
+
+  .workspace-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px 12px 13px;
+  }
+
+  .workspace-summary,
+  .workspace-summary .workspace-summary-total {
+    width: 100%;
+  }
+
+  .toolbar {
+    padding: 0 12px 12px;
+  }
+
+  .grid-panel,
+  .import-progress,
+  .invoice-check,
+  .output-ready {
+    margin-right: 12px;
+    margin-left: 12px;
+  }
+
+  .key-banner,
+  .workspace-error {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding: 9px 12px;
+  }
+
+  .key-banner p,
+  .workspace-error p {
+    min-width: calc(100% - 32px);
+  }
+
+  .grid-help-line {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .modal-backdrop {
+    padding: 12px;
+  }
+
+  .modal-card {
+    max-height: calc(100vh - 24px);
+  }
+
+  .date-range-fields,
+  .settings-section {
+    grid-template-columns: 1fr;
+  }
+
+  .date-range-arrow {
+    display: none;
+  }
+
+  .onboarding-card {
+    width: calc(100% - 24px);
+    padding: 30px 22px 27px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    /* biome-ignore lint/complexity/noImportantStyles: Reduced-motion preferences must override component-level animation specificity. */
+    scroll-behavior: auto !important;
+    /* biome-ignore lint/complexity/noImportantStyles: Reduced-motion preferences must override component-level animation specificity. */
+    animation-duration: 0.01ms !important;
+    /* biome-ignore lint/complexity/noImportantStyles: Reduced-motion preferences must override component-level animation specificity. */
+    animation-iteration-count: 1 !important;
+    /* biome-ignore lint/complexity/noImportantStyles: Reduced-motion preferences must override component-level animation specificity. */
+    transition-duration: 0.01ms !important;
+  }
+}

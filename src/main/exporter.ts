@@ -1,28 +1,40 @@
-import { type BrowserWindow, clipboard, dialog, shell } from "electron";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { type BrowserWindow, clipboard, dialog, shell } from "electron";
+import { invoiceToCsv, invoiceToTsv } from "../shared/tabular";
 import type {
   ExportPackageOptions,
   ExportPackageResult,
   InvoiceDocument,
   ReceiptDebug,
   ReceiptPreviewPayload,
+  ReceiptRecord,
 } from "../shared/types";
-import { invoiceToCsv, invoiceToTsv } from "../shared/tabular";
+import { runBounded } from "./bounded-operations";
 import type { InvoiceStore } from "./invoice-store";
-import { pathExists, receiptPreviewBytes, resolveInside, sha256File } from "./receipt-files";
 import { readReceiptDebugFile } from "./receipt-debug";
+import { pathExists, receiptPreviewBytes, resolveInside, sha256File } from "./receipt-files";
 
 const execFileAsync = promisify(execFile);
 const VALID_SHA256 = /^[0-9a-f]{64}$/;
+export const EXPORT_FILE_CONCURRENCY = 4;
+
+interface ReceiptContext {
+  invoiceFolder: string;
+  receipt: ReceiptRecord;
+}
+
+type ExportStore = Pick<InvoiceStore, "loadInvoice" | "getInvoiceFolder">;
 
 export class InvoiceExporter {
+  private readonly receiptContextLoads = new Map<string, Promise<ReceiptContext>>();
+
   constructor(
-    private readonly invoices: InvoiceStore,
+    private readonly invoices: ExportStore,
     private readonly getWindow: () => BrowserWindow | null
   ) {}
 
@@ -51,12 +63,7 @@ export class InvoiceExporter {
   }
 
   async getReceiptPreview(invoiceId: string, receiptId: string): Promise<ReceiptPreviewPayload> {
-    const invoice = await this.invoices.loadInvoice(invoiceId);
-    const receipt = invoice.receipts.find((item) => item.id === receiptId);
-    if (!receipt) {
-      throw new Error("Receipt not found.");
-    }
-    const invoiceFolder = await this.invoices.getInvoiceFolder(invoice.name);
+    const { invoiceFolder, receipt } = await this.getReceiptContext(invoiceId, receiptId);
     const filePath = resolveInside(invoiceFolder, receipt.relativePath);
     const preview = await receiptPreviewBytes(filePath);
     return {
@@ -68,14 +75,33 @@ export class InvoiceExporter {
   }
 
   async getReceiptDebug(invoiceId: string, receiptId: string): Promise<ReceiptDebug | null> {
-    const invoice = await this.invoices.loadInvoice(invoiceId);
-    const receipt = invoice.receipts.find((item) => item.id === receiptId);
-    if (!receipt) {
-      throw new Error("Receipt not found.");
-    }
-    const invoiceFolder = await this.invoices.getInvoiceFolder(invoice.name);
+    const { invoiceFolder, receipt } = await this.getReceiptContext(invoiceId, receiptId);
     const debugPath = resolveInside(invoiceFolder, receipt.debugPath);
     return readReceiptDebugFile(debugPath, receipt.id);
+  }
+
+  private getReceiptContext(invoiceId: string, receiptId: string): Promise<ReceiptContext> {
+    const key = JSON.stringify([invoiceId, receiptId]);
+    const existing = this.receiptContextLoads.get(key);
+    if (existing) return existing;
+
+    const pending = (async () => {
+      const invoice = await this.invoices.loadInvoice(invoiceId);
+      const receipt = invoice.receipts.find((item) => item.id === receiptId);
+      if (!receipt) {
+        throw new Error("Receipt not found.");
+      }
+      const invoiceFolder = await this.invoices.getInvoiceFolder(invoice.id);
+      return { invoiceFolder, receipt };
+    })();
+    this.receiptContextLoads.set(key, pending);
+    const clear = () => {
+      if (this.receiptContextLoads.get(key) === pending) {
+        this.receiptContextLoads.delete(key);
+      }
+    };
+    void pending.then(clear, clear);
+    return pending;
   }
 
   async exportPackage(
@@ -143,21 +169,24 @@ export class InvoiceExporter {
   }
 
   private async verifyManagedFiles(invoice: InvoiceDocument, invoiceFolder: string): Promise<void> {
-    for (const receipt of invoice.receipts) {
-      const expectedSha256 = normalizedReceiptHash(receipt.sha256);
-      const receiptPath = resolveInside(invoiceFolder, receipt.relativePath);
-      if (!(await pathExists(receiptPath))) {
-        throw new Error(`Missing receipt file: ${receipt.originalFilename}`);
-      }
-      const metadata = await fs.lstat(receiptPath);
-      if (metadata.isSymbolicLink() || !metadata.isFile()) {
-        throw new Error(`Receipt is not an ordinary file: ${receipt.originalFilename}`);
-      }
-      const actual = await sha256File(receiptPath);
-      if (actual !== expectedSha256) {
-        throw new Error(`Receipt changed since import: ${receipt.originalFilename}`);
-      }
-    }
+    await runBounded(
+      invoice.receipts.map((receipt) => async () => {
+        const expectedSha256 = normalizedReceiptHash(receipt.sha256);
+        const receiptPath = resolveInside(invoiceFolder, receipt.relativePath);
+        const metadata = await lstatIfExists(receiptPath);
+        if (!metadata) {
+          throw new Error(`Missing receipt file: ${receipt.originalFilename}`);
+        }
+        if (metadata.isSymbolicLink() || !metadata.isFile()) {
+          throw new Error(`Receipt is not an ordinary file: ${receipt.originalFilename}`);
+        }
+        const actual = await sha256File(receiptPath);
+        if (actual !== expectedSha256) {
+          throw new Error(`Receipt changed since import: ${receipt.originalFilename}`);
+        }
+      }),
+      EXPORT_FILE_CONCURRENCY
+    );
   }
 
   private async writeZip(
@@ -227,24 +256,18 @@ export class InvoiceExporter {
         await fs.mkdir(path.join(outputFolder, "debug"));
         for (const receipt of invoice.receipts) {
           const source = resolveInside(invoiceFolder, receipt.debugPath);
-          if (await pathExists(source)) {
-            copyOperations.push(() =>
-              copyRegularFile(
+          copyOperations.push(async () => {
+            if (await pathExists(source)) {
+              await copyRegularFile(
                 source,
                 resolveInside(outputFolder, receipt.debugPath),
                 `Debug data for ${receipt.originalFilename}`
-              )
-            );
-          }
+              );
+            }
+          });
         }
       }
-      const results = await Promise.allSettled(copyOperations.map((operation) => operation()));
-      const failure = results.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected"
-      );
-      if (failure) {
-        throw failure.reason;
-      }
+      await runBounded(copyOperations, EXPORT_FILE_CONCURRENCY);
     } catch (error) {
       await fs.rm(outputFolder, { recursive: true, force: true });
       throw error;
@@ -292,6 +315,19 @@ async function copyRegularFile(
   await fs.copyFile(source, destination);
   if (expectedSha256 && (await sha256File(destination)) !== expectedSha256) {
     throw new Error(`${label} changed while it was being exported.`);
+  }
+}
+
+async function lstatIfExists(
+  filePath: string
+): Promise<Awaited<ReturnType<typeof fs.lstat>> | null> {
+  try {
+    return await fs.lstat(filePath);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
   }
 }
 

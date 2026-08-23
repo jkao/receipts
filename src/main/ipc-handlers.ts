@@ -1,12 +1,7 @@
 import { type BrowserWindow, dialog, ipcMain } from "electron";
+import { appErrorPayload, type IpcWireResult } from "../shared/app-error";
 import { IPC } from "../shared/ipc";
-import type {
-  ExportPackageOptions,
-  ImportFilesOptions,
-  InvoicePeriod,
-  InvoiceRow,
-  RemoveInvoiceOptions,
-} from "../shared/types";
+import type { IpcArgs, IpcRequestChannel, IpcResult } from "../shared/ipc-contract";
 import type { InvoiceExporter } from "./exporter";
 import type { ImportManager } from "./import-manager";
 import type { InvoiceChecker } from "./invoice-checker";
@@ -27,6 +22,25 @@ interface Dependencies {
   getWindow(): BrowserWindow | null;
 }
 
+type RequestHandler<Channel extends IpcRequestChannel> = (
+  ...args: IpcArgs<Channel>
+) => IpcResult<Channel> | Promise<IpcResult<Channel>>;
+
+/** Keep Electron's untyped registration API behind the shared channel contract. */
+function handle<Channel extends IpcRequestChannel>(
+  channel: Channel,
+  requestHandler: RequestHandler<Channel>
+): void {
+  ipcMain.handle(channel, async (_event, ...args: unknown[]) => {
+    try {
+      const value = await requestHandler(...(args as IpcArgs<Channel>));
+      return { ok: true, value } satisfies IpcWireResult<IpcResult<Channel>>;
+    } catch (error) {
+      return { ok: false, error: appErrorPayload(error) } satisfies IpcWireResult<never>;
+    }
+  });
+}
+
 export function registerIpcHandlers(deps: Dependencies): void {
   for (const channel of Object.values(IPC)) {
     if (channel !== IPC.importProgress) {
@@ -34,8 +48,8 @@ export function registerIpcHandlers(deps: Dependencies): void {
     }
   }
 
-  ipcMain.handle(IPC.settingsGet, () => deps.settings.getView());
-  ipcMain.handle(IPC.settingsChooseBase, async () => {
+  handle(IPC.settingsGet, () => deps.settings.getView());
+  handle(IPC.settingsChooseBase, async () => {
     const result = await dialog.showOpenDialog(requiredWindow(deps), {
       title: "Choose invoice base folder",
       buttonLabel: "Use this folder",
@@ -46,14 +60,10 @@ export function registerIpcHandlers(deps: Dependencies): void {
     }
     return deps.settings.setBaseFolder(result.filePaths[0]);
   });
-  ipcMain.handle(IPC.settingsUpdateRate, (_event, rateMinor: number) =>
-    deps.settings.setDefaultRate(rateMinor)
-  );
-  ipcMain.handle(IPC.settingsSaveKey, (_event, apiKey: string) =>
-    deps.settings.saveOpenAiKey(apiKey)
-  );
-  ipcMain.handle(IPC.settingsDeleteKey, () => deps.settings.deleteOpenAiKey());
-  ipcMain.handle(IPC.settingsTestKey, async (_event, temporaryKey?: string) => {
+  handle(IPC.settingsUpdateRate, (rateMinor) => deps.settings.setDefaultRate(rateMinor));
+  handle(IPC.settingsSaveKey, (apiKey) => deps.settings.saveOpenAiKey(apiKey));
+  handle(IPC.settingsDeleteKey, () => deps.settings.deleteOpenAiKey());
+  handle(IPC.settingsTestKey, async (temporaryKey) => {
     const apiKey = temporaryKey?.trim() || (await deps.settings.getOpenAiKey());
     if (!apiKey) {
       return { ok: false, message: "Enter an OpenAI API key first." };
@@ -61,38 +71,26 @@ export function registerIpcHandlers(deps: Dependencies): void {
     return new OpenAiReceiptClient(apiKey).testKey();
   });
 
-  ipcMain.handle(IPC.invoicesList, () => deps.invoices.listInvoices());
-  ipcMain.handle(IPC.invoicesCreate, async (_event, period: InvoicePeriod) => {
+  handle(IPC.invoicesList, () => deps.invoices.listInvoices());
+  handle(IPC.invoicesCreate, async (period) => {
     const settings = await deps.settings.read();
     return deps.invoices.createInvoice(period, settings.defaultRateMinor);
   });
-  ipcMain.handle(IPC.invoicesLoad, (_event, invoiceId: string) =>
-    deps.invoices.loadInvoice(invoiceId)
-  );
-  ipcMain.handle(IPC.invoicesRemove, (_event, invoiceId: string, options: RemoveInvoiceOptions) =>
+  handle(IPC.invoicesLoad, (invoiceId) => deps.invoices.loadInvoice(invoiceId));
+  handle(IPC.invoicesRemove, (invoiceId, options) =>
     deps.invoices.removeInvoice(invoiceId, options)
   );
-  ipcMain.handle(IPC.invoicesCheck, (_event, invoiceId: string) =>
-    deps.checker.checkInvoice(invoiceId)
-  );
-  ipcMain.handle(
+  handle(IPC.invoicesCheck, (invoiceId) => deps.checker.checkInvoice(invoiceId));
+  handle(
     IPC.invoicesSetReviewAcknowledgement,
-    (
-      _event,
-      invoiceId: string,
-      fingerprint: string,
-      acknowledged: boolean,
-      expectedRevision: number
-    ) =>
+    (invoiceId, fingerprint, acknowledged, expectedRevision) =>
       deps.checker.setReviewAcknowledgement(invoiceId, fingerprint, acknowledged, expectedRevision)
   );
-  ipcMain.handle(
-    IPC.invoicesSaveRows,
-    (_event, invoiceId: string, rows: InvoiceRow[], expectedRevision: number) =>
-      deps.invoices.saveRows(invoiceId, rows, expectedRevision)
+  handle(IPC.invoicesSaveRows, (invoiceId, rows, expectedRevision) =>
+    deps.invoices.saveRows(invoiceId, rows, expectedRevision)
   );
 
-  ipcMain.handle(IPC.receiptsChoose, async () => {
+  handle(IPC.receiptsChoose, async () => {
     const result = await dialog.showOpenDialog(requiredWindow(deps), {
       title: "Choose receipt images or PDFs",
       buttonLabel: "Add receipts",
@@ -106,46 +104,31 @@ export function registerIpcHandlers(deps: Dependencies): void {
     });
     return result.canceled ? [] : result.filePaths;
   });
-  ipcMain.handle(
-    IPC.receiptsImport,
-    (_event, invoiceId: string, paths: string[], options?: ImportFilesOptions) =>
-      deps.importer.importFiles(invoiceId, paths, options)
+  handle(IPC.receiptsImport, (invoiceId, paths, options) =>
+    deps.importer.importFiles(invoiceId, paths, options)
   );
-  ipcMain.handle(IPC.receiptsRetry, (_event, invoiceId: string, receiptIds: string[]) =>
+  handle(IPC.receiptsImportStart, (invoiceId, paths, options) =>
+    deps.importer.startImport(invoiceId, paths, options)
+  );
+  handle(IPC.receiptsImportCancel, (jobId) => deps.importer.cancelImport(jobId));
+  handle(IPC.receiptsRetry, (invoiceId, receiptIds) =>
     deps.importer.retryReceipts(invoiceId, receiptIds)
   );
-  ipcMain.handle(IPC.rowsDelete, (_event, invoiceId: string, rowIds: string[]) =>
-    deps.trash.deleteRows(invoiceId, rowIds)
-  );
-  ipcMain.handle(IPC.rowsUndoDelete, (_event, invoiceId: string) =>
-    deps.trash.undoLastDelete(invoiceId)
-  );
-  ipcMain.handle(IPC.receiptPreview, (_event, invoiceId: string, receiptId: string) =>
+  handle(IPC.rowsDelete, (invoiceId, rowIds) => deps.trash.deleteRows(invoiceId, rowIds));
+  handle(IPC.rowsUndoDelete, (invoiceId) => deps.trash.undoLastDelete(invoiceId));
+  handle(IPC.receiptPreview, (invoiceId, receiptId) =>
     deps.exporter.getReceiptPreview(invoiceId, receiptId)
   );
-  ipcMain.handle(IPC.receiptDebug, (_event, invoiceId: string, receiptId: string) =>
+  handle(IPC.receiptDebug, (invoiceId, receiptId) =>
     deps.exporter.getReceiptDebug(invoiceId, receiptId)
   );
-  ipcMain.handle(
-    IPC.invoiceCopyTsv,
-    (
-      _event,
-      invoiceId: string,
-      rowIds: string[] | null,
-      includeHeaders: boolean,
-      includeTotals: boolean
-    ) => deps.exporter.copyTsv(invoiceId, rowIds, includeHeaders, includeTotals)
+  handle(IPC.invoiceCopyTsv, (invoiceId, rowIds, includeHeaders, includeTotals) =>
+    deps.exporter.copyTsv(invoiceId, rowIds, includeHeaders, includeTotals)
   );
-  ipcMain.handle(IPC.invoiceReveal, (_event, invoiceId: string) =>
-    deps.exporter.revealInvoice(invoiceId)
-  );
-  ipcMain.handle(IPC.invoiceBuildOutput, (_event, invoiceId: string) =>
-    deps.output.buildInvoiceOutput(invoiceId)
-  );
-  ipcMain.handle(IPC.invoiceRevealOutput, (_event, invoiceId: string) =>
-    deps.output.revealOutput(invoiceId)
-  );
-  ipcMain.handle(IPC.invoiceExport, (_event, invoiceId: string, options: ExportPackageOptions) =>
+  handle(IPC.invoiceReveal, (invoiceId) => deps.exporter.revealInvoice(invoiceId));
+  handle(IPC.invoiceBuildOutput, (invoiceId) => deps.output.buildInvoiceOutput(invoiceId));
+  handle(IPC.invoiceRevealOutput, (invoiceId) => deps.output.revealOutput(invoiceId));
+  handle(IPC.invoiceExport, (invoiceId, options) =>
     deps.exporter.exportPackage(invoiceId, options)
   );
 }

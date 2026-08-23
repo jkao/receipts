@@ -4,10 +4,14 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { InvoicePeriod, InvoiceRow, ReceiptRecord } from "../shared/types";
+import type { InvoiceDocument, InvoicePeriod, InvoiceRow, ReceiptRecord } from "../shared/types";
+import { invoiceDocumentFingerprint } from "./invoice-codec";
 import {
   BaseFolderNotConfiguredError,
+  INVOICE_VIEW_REPAIR_CONCURRENCY,
+  INVOICE_VIEW_STATE_FILENAME,
   InvoiceDeletedError,
+  InvoiceNotFoundError,
   InvoiceStore,
   InvoiceValidationError,
   RevisionConflictError,
@@ -44,6 +48,15 @@ function receipt(overrides: Partial<ReceiptRecord> = {}): ReceiptRecord {
     importedAt: "2026-02-01T00:00:00.000Z",
     ...overrides,
   };
+}
+
+function cleanViewState(invoice: InvoiceDocument) {
+  return {
+    schemaVersion: 1,
+    revision: invoice.revision,
+    invoiceSha256: invoiceDocumentFingerprint(invoice),
+    state: "clean",
+  } as const;
 }
 
 describe("InvoiceStore", () => {
@@ -386,13 +399,59 @@ describe("InvoiceStore", () => {
       rows: InvoiceRow[];
     };
     expect(persisted).toMatchObject({ revision: 0, rows: [] });
+    expect(
+      JSON.parse(await fs.readFile(path.join(folder, INVOICE_VIEW_STATE_FILENAME), "utf8"))
+    ).toMatchObject({
+      schemaVersion: 1,
+      revision: 1,
+      invoiceSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      state: "dirty",
+    });
     expect((await fs.readdir(folder)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 
     await fs.rm(blockedView, { recursive: true });
+    await store.listInvoices();
     await expect(store.loadInvoice(created.id)).resolves.toMatchObject({
       revision: 0,
       rows: [],
     });
+    expect(await fs.readFile(path.join(folder, "invoice.tsv"), "utf8")).not.toContain("Key Foods");
+    expect(
+      JSON.parse(await fs.readFile(path.join(folder, INVOICE_VIEW_STATE_FILENAME), "utf8"))
+    ).toEqual(cleanViewState(created));
+  });
+
+  it("does not advance past an uncertain dirty-marker durability barrier", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const folder = await store.getInvoiceFolder(created.id);
+    const internals = store as unknown as {
+      writeViewState(
+        folder: string,
+        invoice: InvoiceDocument,
+        state: "clean" | "dirty"
+      ): Promise<boolean>;
+    };
+    const originalWriteViewState = internals.writeViewState.bind(store);
+    const writeViewState = vi
+      .spyOn(internals, "writeViewState")
+      .mockImplementation(async (targetFolder, invoice, state) => {
+        const directorySynced = await originalWriteViewState(targetFolder, invoice, state);
+        return invoice.revision === 1 && state === "dirty" ? false : directorySynced;
+      });
+
+    try {
+      await expect(store.saveRows(created.id, [row()], created.revision)).rejects.toThrow(
+        "durable invoice view update marker"
+      );
+    } finally {
+      writeViewState.mockRestore();
+    }
+
+    await expect(store.loadInvoice(created.id)).resolves.toEqual(created);
+    await expect(store.listInvoices()).resolves.toMatchObject([{ id: created.id }]);
+    expect(
+      JSON.parse(await fs.readFile(path.join(folder, INVOICE_VIEW_STATE_FILENAME), "utf8"))
+    ).toEqual(cleanViewState(created));
   });
 
   it("persists a chosen row order unchanged in JSON, TSV, and CSV", async () => {
@@ -555,7 +614,7 @@ describe("InvoiceStore", () => {
     });
   });
 
-  it("regenerates missing or stale TSV and CSV on load", async () => {
+  it("keeps loadInvoice read-only and regenerates views only when explicitly requested", async () => {
     const created = await store.createInvoice(PERIOD, 4500);
     const saved = await store.saveRows(created.id, [row()], 0);
     const folder = await store.getInvoiceFolder(saved.id);
@@ -564,8 +623,244 @@ describe("InvoiceStore", () => {
 
     const loaded = await store.loadInvoice(saved.id);
     expect(loaded.revision).toBe(1);
+    expect(await fs.readFile(path.join(folder, "invoice.tsv"), "utf8")).toBe("stale");
+    await expect(fs.access(path.join(folder, "invoice.csv"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    await store.regenerateViews(saved.id);
     expect(await fs.readFile(path.join(folder, "invoice.tsv"), "utf8")).toContain("Key Foods");
     expect(await fs.readFile(path.join(folder, "invoice.csv"), "utf8")).toContain("Key Foods");
+  });
+
+  it("repairs a crash-dirty view state from authoritative JSON during invoice listing", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const saved = await store.saveRows(created.id, [row()], created.revision);
+    const folder = await store.getInvoiceFolder(saved.id);
+    await fs.writeFile(path.join(folder, "invoice.tsv"), "future uncommitted rows", "utf8");
+    await fs.rm(path.join(folder, "invoice.csv"));
+    await fs.writeFile(
+      path.join(folder, INVOICE_VIEW_STATE_FILENAME),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        revision: saved.revision + 1,
+        invoiceSha256: invoiceDocumentFingerprint({ ...saved, revision: saved.revision + 1 }),
+        state: "dirty",
+      })}\n`,
+      "utf8"
+    );
+
+    await expect(store.listInvoices()).resolves.toMatchObject([{ id: saved.id }]);
+
+    expect(await fs.readFile(path.join(folder, "invoice.tsv"), "utf8")).toContain("Key Foods");
+    expect(await fs.readFile(path.join(folder, "invoice.csv"), "utf8")).toContain("Key Foods");
+    expect(
+      JSON.parse(await fs.readFile(path.join(folder, INVOICE_VIEW_STATE_FILENAME), "utf8"))
+    ).toEqual(cleanViewState(saved));
+    await expect(store.loadInvoice(saved.id)).resolves.toEqual(saved);
+  });
+
+  it("does not reject a committed mutation when the final clean marker cannot be written", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const folder = await store.getInvoiceFolder(created.id);
+    const internals = store as unknown as {
+      writeViewState(
+        folder: string,
+        invoice: InvoiceDocument,
+        state: "clean" | "dirty"
+      ): Promise<boolean>;
+    };
+    const originalWriteViewState = internals.writeViewState.bind(store);
+    const writeViewState = vi
+      .spyOn(internals, "writeViewState")
+      .mockImplementation(async (targetFolder, invoice, state) => {
+        if (invoice.revision === 1 && state === "clean") {
+          throw new Error("simulated marker failure");
+        }
+        return originalWriteViewState(targetFolder, invoice, state);
+      });
+
+    let saved: InvoiceDocument;
+    try {
+      saved = await store.saveRows(created.id, [row()], created.revision);
+    } finally {
+      writeViewState.mockRestore();
+    }
+
+    expect(saved.revision).toBe(1);
+    await expect(store.loadInvoice(created.id)).resolves.toEqual(saved);
+    expect(
+      JSON.parse(await fs.readFile(path.join(folder, INVOICE_VIEW_STATE_FILENAME), "utf8"))
+    ).toEqual({ ...cleanViewState(saved), state: "dirty" });
+
+    await store.listInvoices();
+    expect(
+      JSON.parse(await fs.readFile(path.join(folder, INVOICE_VIEW_STATE_FILENAME), "utf8"))
+    ).toEqual(cleanViewState(saved));
+  });
+
+  it("upgrades a legacy marker-less folder during listing and takes the no-op fast path thereafter", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const saved = await store.saveRows(created.id, [row()], created.revision);
+    const folder = await store.getInvoiceFolder(saved.id);
+    await fs.rm(path.join(folder, INVOICE_VIEW_STATE_FILENAME));
+    await fs.writeFile(path.join(folder, "invoice.tsv"), "legacy stale view", "utf8");
+
+    await expect(store.listInvoices()).resolves.toMatchObject([{ id: saved.id }]);
+    expect(await fs.readFile(path.join(folder, "invoice.tsv"), "utf8")).toContain("Key Foods");
+    await expect(store.repairDerivedViews()).resolves.toEqual({
+      checked: 1,
+      repaired: 0,
+      failures: [],
+    });
+
+    const internals = store as unknown as {
+      writeViews(folder: string, invoice: InvoiceDocument): Promise<void>;
+    };
+    const writeViews = vi.spyOn(internals, "writeViews");
+    const readFile = vi.spyOn(fs, "readFile");
+    try {
+      await store.loadInvoice(saved.id);
+      expect(
+        readFile.mock.calls.some(([filename]) => /invoice\.(?:tsv|csv)$/.test(String(filename)))
+      ).toBe(false);
+      expect(writeViews).not.toHaveBeenCalled();
+      readFile.mockClear();
+      await expect(store.listInvoices()).resolves.toHaveLength(1);
+
+      expect(writeViews).not.toHaveBeenCalled();
+      expect(
+        readFile.mock.calls.some(([filename]) => /invoice\.(?:tsv|csv)$/.test(String(filename)))
+      ).toBe(false);
+      expect(
+        readFile.mock.calls.filter(
+          ([filename]) => path.basename(String(filename)) === "invoice.json"
+        )
+      ).toHaveLength(1);
+    } finally {
+      writeViews.mockRestore();
+      readFile.mockRestore();
+    }
+  });
+
+  it("bounds maintenance work across marker-less invoice folders", async () => {
+    const invoices = [];
+    for (let month = 1; month <= INVOICE_VIEW_REPAIR_CONCURRENCY * 2 + 1; month += 1) {
+      const monthText = String(month).padStart(2, "0");
+      const invoice = await store.createInvoice(
+        { startDate: `2026-${monthText}-01`, endDate: `2026-${monthText}-28` },
+        4500
+      );
+      invoices.push(invoice);
+      await fs.rm(path.join(await store.getInvoiceFolder(invoice.id), INVOICE_VIEW_STATE_FILENAME));
+    }
+
+    const internals = store as unknown as {
+      writeViews(folder: string, invoice: InvoiceDocument): Promise<void>;
+    };
+    const originalWriteViews = internals.writeViews.bind(store);
+    let active = 0;
+    let maximumActive = 0;
+    const writeViews = vi.spyOn(internals, "writeViews").mockImplementation(async (...args) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      try {
+        await originalWriteViews(...args);
+      } finally {
+        active -= 1;
+      }
+    });
+
+    try {
+      await expect(store.repairDerivedViews()).resolves.toEqual({
+        checked: invoices.length,
+        repaired: invoices.length,
+        failures: [],
+      });
+      expect(maximumActive).toBe(INVOICE_VIEW_REPAIR_CONCURRENCY);
+    } finally {
+      writeViews.mockRestore();
+    }
+  });
+
+  it("keeps a damaged derived view from hiding an otherwise healthy invoice", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const folder = await store.getInvoiceFolder(created.id);
+    await fs.rm(path.join(folder, INVOICE_VIEW_STATE_FILENAME));
+    await fs.rm(path.join(folder, "invoice.tsv"));
+    await fs.mkdir(path.join(folder, "invoice.tsv"));
+
+    await expect(store.listInvoices()).resolves.toMatchObject([{ id: created.id }]);
+    await expect(store.repairDerivedViews()).resolves.toMatchObject({
+      checked: 1,
+      repaired: 0,
+      failures: [{ invoiceId: created.id, invoiceName: created.name }],
+    });
+    await expect(store.loadInvoice(created.id)).resolves.toMatchObject({ id: created.id });
+  });
+
+  it("uses its validated alias cache for repeated ID and name operations", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const discoverInvoices = vi.spyOn(
+      store as unknown as { discoverInvoices: () => Promise<unknown[]> },
+      "discoverInvoices"
+    );
+
+    await store.loadInvoice(created.id);
+    await store.getInvoiceFolder(created.id);
+    const saved = await store.mutateInvoice(created.id, (draft) => {
+      draft.rows.push(row());
+    });
+    await store.loadInvoice(saved.name);
+
+    expect(discoverInvoices).not.toHaveBeenCalled();
+  });
+
+  it("scopes cached aliases to the configured base folder", async () => {
+    const firstBase = baseFolder;
+    const secondBase = await fs.mkdtemp(path.join(os.tmpdir(), "receipt-invoice-store-second-"));
+    let activeBase = firstBase;
+    let scopedId = 0;
+    const scopedStore = new InvoiceStore(() => activeBase, {
+      idFactory: () => `scoped-${++scopedId}`,
+      now: () => new Date("2026-02-01T00:00:00.000Z"),
+    });
+
+    try {
+      const first = await scopedStore.createInvoice(PERIOD, 4500);
+      activeBase = secondBase;
+      await expect(scopedStore.loadInvoice(first.id)).rejects.toBeInstanceOf(InvoiceNotFoundError);
+      const second = await scopedStore.createInvoice(PERIOD, 4500);
+      expect(second.id).not.toBe(first.id);
+
+      activeBase = firstBase;
+      await expect(scopedStore.loadInvoice(first.id)).resolves.toMatchObject({ id: first.id });
+      await expect(scopedStore.loadInvoice(second.id)).rejects.toBeInstanceOf(InvoiceNotFoundError);
+    } finally {
+      await fs.rm(secondBase, { recursive: true, force: true });
+    }
+  });
+
+  it("invalidates a cached alias when invoice.json is replaced externally", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const folder = await store.getInvoiceFolder(created.id);
+    const invoicePath = path.join(folder, "invoice.json");
+    const replaced = JSON.parse(await fs.readFile(invoicePath, "utf8")) as InvoiceDocument;
+    replaced.id = "externally-replaced-id";
+    replaced.rows = [row()];
+    await fs.writeFile(invoicePath, `${JSON.stringify(replaced, null, 2)}\n`, "utf8");
+
+    await expect(store.loadInvoice(created.id)).rejects.toBeInstanceOf(InvoiceNotFoundError);
+    await expect(store.loadInvoice("externally-replaced-id")).resolves.toMatchObject({
+      id: "externally-replaced-id",
+    });
+
+    await expect(store.listInvoices()).resolves.toMatchObject([{ id: "externally-replaced-id" }]);
+    expect(await fs.readFile(path.join(folder, "invoice.tsv"), "utf8")).toContain("Key Foods");
+    expect(
+      JSON.parse(await fs.readFile(path.join(folder, INVOICE_VIEW_STATE_FILENAME), "utf8"))
+    ).toEqual(cleanViewState(replaced));
   });
 
   it("finds receipt hashes across invoices and exposes the canonical folder", async () => {

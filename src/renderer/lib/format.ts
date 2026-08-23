@@ -1,3 +1,4 @@
+import { appErrorMessage } from "../../shared/app-error";
 import type { InvoiceDocument, InvoiceRow, InvoiceSummary } from "../../shared/types";
 import {
   calculateInvoiceTotals,
@@ -116,7 +117,7 @@ export function newRowId(): string {
 }
 
 export function messageFromError(error: unknown): string {
-  return error instanceof Error ? error.message : "Something went wrong.";
+  return error instanceof Error ? appErrorMessage(error) : "Something went wrong.";
 }
 
 export function todayIso(): string {

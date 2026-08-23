@@ -194,11 +194,13 @@ export interface SettingsView {
 }
 
 export interface ImportProgress {
+  /** Present for cancelable background imports; omitted by legacy synchronous work. */
+  jobId?: string;
   invoiceId: string;
   current: number;
   total: number;
   filename: string;
-  status: ReceiptStatus | "copying" | "duplicate";
+  status: ReceiptStatus | "copying" | "duplicate" | "complete" | "cancelled" | "failed";
   message?: string;
 }
 
@@ -214,6 +216,17 @@ export interface ImportBatchResult {
   importedCount: number;
   duplicates: ImportDuplicate[];
   errors: Array<{ filename: string; message: string }>;
+}
+
+/** Durable local result returned before a background receipt scan begins. */
+export interface ImportJobStartResult extends ImportBatchResult {
+  jobId: string;
+}
+
+export interface ImportJobCancelResult {
+  jobId: string;
+  /** False when the job is unknown, already finished, or already cancelling. */
+  cancelled: boolean;
 }
 
 export interface ImportFilesOptions {
@@ -286,10 +299,18 @@ export interface DesktopApi {
     paths: string[],
     options?: ImportFilesOptions
   ): Promise<ImportBatchResult>;
+  startImport(
+    invoiceId: string,
+    paths: string[],
+    options?: ImportFilesOptions
+  ): Promise<ImportJobStartResult>;
+  cancelImport(jobId: string): Promise<ImportJobCancelResult>;
   retryReceipts(invoiceId: string, receiptIds: string[]): Promise<InvoiceDocument>;
   deleteRows(invoiceId: string, rowIds: string[]): Promise<InvoiceDocument>;
   undoLastDelete(invoiceId: string): Promise<InvoiceDocument>;
   getReceiptPreview(invoiceId: string, receiptId: string): Promise<ReceiptPreview>;
+  /** Release the active receipt Blob URL and invalidate any pending preview request. */
+  releaseReceiptPreview(): void;
   getReceiptDebug(invoiceId: string, receiptId: string): Promise<ReceiptDebug | null>;
   copyTsv(
     invoiceId: string,

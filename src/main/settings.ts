@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { AppSettings, SettingsView } from "../shared/types";
+import { KeyedSerialQueue } from "./serial-queue";
 
 const DEFAULT_SETTINGS: AppSettings = {
   schemaVersion: 1,
@@ -12,7 +13,7 @@ const DEFAULT_SETTINGS: AppSettings = {
 
 export class SettingsStore {
   private readonly settingsPath: string;
-  private writeQueue: Promise<void> = Promise.resolve();
+  private readonly writes = new KeyedSerialQueue<"settings">();
 
   constructor(userDataDirectory: string) {
     this.settingsPath = path.join(userDataDirectory, "settings.json");
@@ -125,12 +126,10 @@ export class SettingsStore {
   }
 
   private async update(updater: (settings: AppSettings) => AppSettings): Promise<void> {
-    const operation = this.writeQueue.then(async () => {
+    return this.writes.run("settings", async () => {
       const current = await this.read();
       await this.write(updater(current));
     });
-    this.writeQueue = operation.catch(() => undefined);
-    return operation;
   }
 
   private async write(settings: AppSettings): Promise<void> {

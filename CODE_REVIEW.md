@@ -1,96 +1,128 @@
-# Code Review — 2026-08-21
+# Code Review — 2026-08-23
 
 ## Outcome
 
-The macOS MVP passed a full consistency, simplicity, performance, integrity, and lifecycle review.
-The review fixed the release-blocking races and unsafe filesystem edges that were found, added
-regression coverage for them, and established repeatable lint, format, coverage, type, build, and
-packaging checks.
+The macOS MVP passed a focused cleanliness, readability, usability, accessibility, performance,
+integrity, and lifecycle review. All release-blocking findings found in that review were fixed and
+covered by the automated release gate.
 
-The app remains intentionally local and single-user: Electron + React, JSON files as the database,
-sequential receipt scanning, and no hosted service beyond user-authorized OpenAI extraction.
+The product remains intentionally local and single-user: Electron + React, invoice JSON as the
+authoritative database, and no hosted service beyond user-authorized OpenAI receipt extraction.
 
 ## Material fixes
 
+### Performance and responsiveness
+
+- Invoice IDs now resolve through a base-folder-scoped alias cache. A synthetic 200-invoice,
+  100-rows-per-invoice history measured a warm ID load at about 0.96 ms versus 89 ms cold (about
+  93× faster).
+- Opening an invoice is a pure JSON read. A small revision-and-SHA-256 marker identifies current
+  TSV/CSV views; a bounded startup/list pass repairs only stale or interrupted views.
+- Batch import validates and hashes source files once, checks all hashes against invoice history in
+  one call, reads the API key once, and commits prepared receipt metadata in one mutation.
+- Accepted imports become durable before extraction, then scan in the background. Work is bounded
+  globally to two provider preparations/requests across every invoice and retry, with cancellation
+  while queued or active.
+- Likely-duplicate detection groups pre-normalized date, amount, and merchant keys instead of
+  comparing every row pair. A 5,000-candidate diagnostic fell from about 3.1 seconds to 6.9 ms
+  (about 453× faster).
+- Grid editors keep raw keystrokes locally and publish one validated row at commit. Tab, Enter,
+  blur, outside actions, close, and file drop share safe commit behavior; unchanged drafts are true
+  no-ops.
+- Autosave defers cloning/signature work until debounce or flush, coalesces in-flight saves, and
+  suppresses edit-then-revert writes. Rows are re-sorted only when an edit affects the active sort.
+- Receipt preview/debug reads share their in-flight invoice lookup. Blob URLs are explicitly
+  released, stale drawer resources are hidden immediately, and same-status rescans reload by
+  a scan-specific resource generation without reloading on unrelated invoice edits.
+- Export, output construction, receipt hashing, copying, and provider preparation use small bounded
+  worker pools instead of serial bottlenecks or unbounded fan-out.
+
 ### Data integrity and concurrency
 
-- Invoice ID and name aliases now serialize through one canonical per-invoice queue.
-- TSV/CSV views settle before authoritative JSON commits, so a derived-view failure cannot advance
-  the invoice revision.
-- PDF/output rendering happens outside the invoice lock, but the final revision check and atomic
-  output swap happen inside it. A concurrent edit rejects a stale build and preserves prior output.
-- Atomic writes use unpredictable exclusive temporary files and reject symlinked authoritative
-  files.
-- Interrupted deletes use a prepared trash manifest and can recover safely; failed cleanup after a
-  committed undo no longer rolls restored files back.
-- Missing or symlinked configured base folders are rejected instead of silently recreated.
-- Revision overflow and large-hours aggregation edge cases are guarded.
-- Invoice removal is revisioned and queue-safe: recoverable removal uses a portable `DELETED.json`
-  sentinel, while optional permanent deletion is constrained to the exact canonical invoice folder
-  and records interrupted/partial deletion state before removing files.
+- Invoice ID and folder aliases serialize through one canonical per-invoice queue, extracted into a
+  reusable keyed serial-queue module.
+- Atomic persistence and invoice validation/serialization are isolated in focused modules instead
+  of being interleaved with store discovery logic.
+- Authoritative JSON commits are atomic and directory-synced. The derived-view marker is written
+  dirty before a mutation and clean only after TSV, CSV, and authoritative JSON reach the same
+  revision.
+- View repair rechecks authoritative state inside the same invoice queue, so repair and mutation
+  cannot cross revisions.
+- Batch preparation rolls back every copied receipt if its single metadata commit fails.
+- Cancellation has an explicit commit point: before invoice commit, the receipt returns to queued
+  and newly written debug JSON is removed or the prior bytes are restored; after commit, the
+  extracted row wins and is reported as complete.
+- Unexpected background-scheduler failures requeue only still-scanning receipts and emit one
+  terminal failed state. The renderer refreshes that durable failure state rather than announcing
+  completion.
+- Per-invoice terminal refreshes survive navigation/open races without leaving global folder or
+  close locks stranded.
+- Output/export integrity still verifies managed receipt paths, file types, and SHA-256 values.
 
-### Receipt and IPC boundaries
+### Readability and maintainability
 
-- Renderer import paths must originate from the native picker or an actual dropped `File`.
-- Managed preview paths are derived in the main process and constrained to the invoice folder.
-- Preview bytes cross IPC as binary and become a bounded Blob URL rather than a Base64 data URL.
-- Receipt processing has a 20 MB per-file limit, bounding the remaining OpenAI Base64/JSON peak.
-- Receipt debug JSON is limited to 2 MiB and structurally validated before use.
-- Persisted SHA-256 values and timestamps are validated and normalized.
-- Copied/exported receipts are hash-verified, and export destinations cannot resolve inside live
-  invoice data.
-- Failed receipt preparation and incomplete successful-HTTP provider responses become explicit
-  scan errors instead of leaving ambiguous state.
+- The renderer shell was reduced by extracting onboarding, sidebar, modals, copy actions, save and
+  import status, toast presentation, import-job state, import workflow, idle scheduling, and pure
+  state-transition helpers.
+- The former monolithic stylesheet is split by base, layout, component, grid, preview, modal, and
+  responsive concerns.
+- IPC channels now have one typed contract and structured success/error envelopes. Expected
+  filesystem and validation failures retain user-safe messages through the preload boundary.
+- Main-process helpers now isolate atomic writes, bounded operations, invoice codecs, and keyed
+  queues, each with direct tests.
 
-### Renderer lifecycle and accessibility
+### UX and accessibility
 
-- Active file operations prevent accidental window close and lock grid mutations.
-- Stale check, delete, undo, reload, and autosave completions cannot overwrite newer state.
-- Revision conflicts persist until the user reloads rather than being cleared by a coincidental row
-  snapshot.
-- Receipt preview and debug loading are independent, cancellable by identity, and restore drawer
-  focus correctly.
-- Modal busy states, live regions, grid editors, review controls, and image-preview keyboard
-  semantics were tightened.
-- Selected-row reconciliation is linear rather than repeatedly scanning rows.
+- Receipt scanning no longer freezes the whole app. The active invoice is read-only while its scan
+  runs, but other invoices remain usable; progress and cancellation stay visible.
+- Cancel is shown only after the main process has registered a cancelable job, avoiding a false
+  cancel action during hashing/copying.
+- Money, hours, rate, comment, and date editors validate local drafts, keep invalid values focused,
+  expose accessible error text, and commit correctly on Enter, Tab, blur, navigation, close, and
+  receipt drop.
+- Responsive drawer mode uses a scrim and removes obscured workspace controls from the keyboard and
+  accessibility trees. Modal and drawer focus is restored predictably.
+- The hidden-inset macOS title bar has an isolated drag handle in the sidebar's unused top inset,
+  clear of the traffic lights and every interactive control.
+- Labels, confirmation copy, disclosures, progress states, toasts, empty states, copy/export names,
+  and review language were made more explicit and consistent.
+- The grid retains virtualized rows, stable row keys, memoized columns/maps/totals, and fixed-height
+  rendering, so DOM size remains tied to the viewport.
 
 ## Automated quality gates
 
-`make check` (or `npm run check`) now runs:
+`make check` (or `npm run check`) runs:
 
 1. Biome lint with warnings treated as failures.
 2. Biome format verification.
 3. All Vitest tests with V8 coverage and enforced thresholds.
 4. TypeScript checking and production builds for both Electron processes.
 
-The current suite contains 181 tests across 25 test files.
+The current suite contains 286 tests across 43 test files.
 
 Current measured coverage:
 
 | Scope | Statements | Branches | Functions | Lines |
 | --- | ---: | ---: | ---: | ---: |
-| Whole project | 55.39% | 47.80% | 55.93% | 57.24% |
-| Electron main process | 78.77% | 72.06% | 79.65% | 80.11% |
-| Shared finance/tabular logic | 98.38% | 92.85% | 100% | 98.33% |
+| Whole project | 63.93% | 57.95% | 68.88% | 65.74% |
+| Electron main process | 81.67% | 73.48% | 84.63% | 83.37% |
+| Shared finance/tabular/error logic | 98.02% | 93.71% | 100% | 98.60% |
 
-The gate floors are deliberately below the measured values to allow small refactors while still
-preventing material regression: whole-project 52/43/52/54, main-process 75/65/75/76, and shared
-logic 95/90/95/95 (statements/branches/functions/lines).
+The production build is small for a desktop renderer: 320.70 kB JavaScript (98.77 kB gzip) and
+46.68 kB CSS (10.10 kB gzip). The compiled Electron main bundle is 177.14 kB and preload is 7.05
+kB before app packaging.
 
 ## Non-blocking follow-ups
 
-- `src/renderer/App.tsx` remains large. Its pure helpers, autosave hook, and several presentational
-  components are tested, but the full application shell and data grid need a future DOM or Electron
-  end-to-end harness. This is the largest current maintenance and coverage gap.
-- Autosave deliberately clones and signs the row array on edits. That is simple and safe for the
-  expected invoice sizes; cache row signatures only if real invoices show measurable latency.
-- A preview still requires several binary copies and OpenAI still needs Base64 inside its request.
-  The 20 MB limit bounds this cost; streaming/provider-upload redesign is not justified for the MVP.
-- Opening an invoice regenerates TSV/CSV. An obstructed derived-view path can therefore prevent
-  opening otherwise-valid JSON; separating open from view repair would improve recovery UX.
-- Automatic recovery from `invoice.json.bak`, a future settings-schema migration, and bounded row or
-  path-array IPC payloads are worthwhile hardening if this grows beyond one trusted local user.
-- The dependency audit is clean for production packages. A low-severity esbuild advisory remains in
-  dev dependencies and affects Windows development servers, outside this macOS-only release.
+- `src/renderer/App.tsx` is substantially smaller and its extracted state machines are directly
+  tested, but an automated packaged-Electron workflow would add confidence across native dialogs,
+  React Data Grid, and application close/relaunch as one system.
+- Receipt previews still read and transfer the complete bounded file, and OpenAI requests still
+  require Base64 payloads. The 20 MB per-file limit bounds this cost; thumbnails or a provider file
+  upload path would only be justified by real large-file usage.
+- The alias cache removes repeated history scans after discovery, but a workspace with many
+  thousands of invoices will still pay one bounded discovery pass on startup or cache invalidation.
+- Automatic recovery from `invoice.json.bak` and a future settings-schema migration remain useful
+  hardening if the app expands beyond one trusted local user.
 
-These are not known release blockers for the stated single-user macOS scope.
+These are not known blockers for the stated single-user macOS scope.

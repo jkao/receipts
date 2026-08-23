@@ -15,7 +15,7 @@ vi.mock("electron", () => ({
   shell: { openPath: electron.openPath },
 }));
 
-import { buildInvoiceHtml, InvoiceOutputBuilder } from "./invoice-output";
+import { buildInvoiceHtml, InvoiceOutputBuilder, OUTPUT_FILE_CONCURRENCY } from "./invoice-output";
 import { InvoiceStore } from "./invoice-store";
 
 describe("invoice output HTML", () => {
@@ -163,6 +163,43 @@ describe("InvoiceOutputBuilder", () => {
 
     await builder.revealOutput(invoice.id);
     expect(revealPath).toHaveBeenCalledWith(result.outputPath);
+  });
+
+  it("bounds concurrent receipt copies while staging client output", async () => {
+    const invoice = await createInvoice(store);
+    const invoiceFolder = await store.getInvoiceFolder(invoice.id);
+    await addReceipts(
+      store,
+      invoice.id,
+      invoiceFolder,
+      Array.from({ length: OUTPUT_FILE_CONCURRENCY * 2 + 1 }, (_, index) =>
+        receiptInput(`bounded-${index}`, `bounded-${index}.png`, Buffer.from(`bytes-${index}`))
+      )
+    );
+    const actualCopyFile = fs.copyFile.bind(fs);
+    let activeCopies = 0;
+    let maximumActiveCopies = 0;
+    const copyFileSpy = vi.spyOn(fs, "copyFile").mockImplementation(async (...args) => {
+      activeCopies += 1;
+      maximumActiveCopies = Math.max(maximumActiveCopies, activeCopies);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      try {
+        await actualCopyFile(...args);
+      } finally {
+        activeCopies -= 1;
+      }
+    });
+
+    try {
+      await new InvoiceOutputBuilder(store, {
+        renderPdf: async () => pdfBuffer("bounded output"),
+        nonce: () => "bounded-output",
+      }).buildInvoiceOutput(invoice.id);
+    } finally {
+      copyFileSpy.mockRestore();
+    }
+
+    expect(maximumActiveCopies).toBe(OUTPUT_FILE_CONCURRENCY);
   });
 
   it("loads the latest revision and preserves its persisted row order in PDF HTML", async () => {

@@ -14,6 +14,8 @@ export const IPC = {
   invoicesSaveRows: "invoices:save-rows",
   receiptsChoose: "receipts:choose",
   receiptsImport: "receipts:import",
+  receiptsImportStart: "receipts:import-start",
+  receiptsImportCancel: "receipts:import-cancel",
   receiptsRetry: "receipts:retry",
   rowsDelete: "rows:delete",
   rowsUndoDelete: "rows:undo-delete",

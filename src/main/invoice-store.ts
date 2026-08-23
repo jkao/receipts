@@ -1,25 +1,44 @@
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { normalizeHours } from "../shared/finance";
 import { invoiceToCsv, invoiceToTsv } from "../shared/tabular";
 import {
   INVOICE_DELETION_SCHEMA_VERSION,
   INVOICE_SCHEMA_VERSION,
-  type ImportMethod,
   type InvoiceDeletionSentinel,
   type InvoiceDocument,
   type InvoicePeriod,
   type InvoiceRemovalResult,
-  type InvoiceReviewAcknowledgement,
   type InvoiceRow,
   type InvoiceSummary,
-  type ReceiptRecord,
-  type ReceiptStatus,
   type RemoveInvoiceOptions,
-  type SourceKind,
 } from "../shared/types";
+import { atomicWriteFile, fileExists, isErrno, syncDirectory } from "./atomic-file";
+import { mapBounded } from "./bounded-operations";
+import {
+  cloneInvoiceDocument,
+  INVOICE_VIEW_STATE_SCHEMA_VERSION,
+  InvoiceValidationError,
+  type InvoiceViewState,
+  invoiceDocumentFingerprint,
+  requiredString,
+  safeInteger,
+  serializeInvoiceDeletionSentinel,
+  serializeInvoiceDocument,
+  serializeInvoiceViewState,
+  validateInvoiceDeletionSentinel,
+  validateInvoiceDocument,
+  validateInvoiceViewState,
+  validatePeriod,
+} from "./invoice-codec";
+import { KeyedSerialQueue } from "./serial-queue";
+
+export {
+  InvoiceValidationError,
+  validateInvoiceDeletionSentinel,
+  validateInvoiceDocument,
+} from "./invoice-codec";
 
 export type BaseFolderGetter = () => string | null | undefined | Promise<string | null | undefined>;
 
@@ -36,6 +55,18 @@ export interface InvoiceHashMatch {
   relativePath: string;
 }
 
+export interface InvoiceViewRepairFailure {
+  invoiceId: string;
+  invoiceName: string;
+  message: string;
+}
+
+export interface InvoiceViewRepairReport {
+  checked: number;
+  repaired: number;
+  failures: InvoiceViewRepairFailure[];
+}
+
 export type InvoiceMutator = (
   draft: InvoiceDocument
 ) => undefined | InvoiceDocument | Promise<undefined | InvoiceDocument>;
@@ -45,16 +76,9 @@ interface DiscoveredInvoice {
   invoice: InvoiceDocument;
 }
 
-const RECEIPT_STATUSES = new Set<ReceiptStatus>([
-  "needs-key",
-  "queued",
-  "scanning",
-  "ready",
-  "needs-review",
-  "error",
-]);
-const IMPORT_METHODS = new Set<ImportMethod>(["drag-drop", "file-picker", "folder", "watcher"]);
-const SOURCE_KINDS = new Set<SourceKind>(["manual", "automation"]);
+export const INVOICE_VIEW_STATE_FILENAME = ".invoice-views.json";
+export const INVOICE_VIEW_REPAIR_CONCURRENCY = 4;
+const INVOICE_VIEW_FILENAMES = ["invoice.tsv", "invoice.csv"] as const;
 
 export class RevisionConflictError extends Error {
   readonly invoiceId: string;
@@ -70,13 +94,6 @@ export class RevisionConflictError extends Error {
     this.invoiceId = invoiceId;
     this.expectedRevision = expectedRevision;
     this.actualRevision = actualRevision;
-  }
-}
-
-export class InvoiceValidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "InvoiceValidationError";
   }
 }
 
@@ -117,350 +134,6 @@ export class BaseFolderNotConfiguredError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function requiredString(value: unknown, label: string, allowEmpty = false): string {
-  if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
-    throw new InvoiceValidationError(`${label} must be a string`);
-  }
-  return value;
-}
-
-function nullableString(value: unknown, label: string): string | null {
-  if (value === null) {
-    return null;
-  }
-  return requiredString(value, label);
-}
-
-function safeInteger(value: unknown, label: string, minimum?: number): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    (minimum !== undefined && value < minimum)
-  ) {
-    throw new InvoiceValidationError(`${label} must be a safe integer`);
-  }
-  return value;
-}
-
-function nullableSafeInteger(value: unknown, label: string): number | null {
-  return value === null ? null : safeInteger(value, label);
-}
-
-function canonicalIsoTimestamp(value: unknown, label: string): string {
-  const timestamp = requiredString(value, label);
-  const parsed = new Date(timestamp);
-  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== timestamp) {
-    throw new InvoiceValidationError(`${label} must use canonical ISO-8601 format`);
-  }
-  return timestamp;
-}
-
-export function validateInvoiceDeletionSentinel(value: unknown): InvoiceDeletionSentinel {
-  if (!isRecord(value)) {
-    throw new InvoiceValidationError("DELETED.json must contain an object");
-  }
-  if (value.schemaVersion !== INVOICE_DELETION_SCHEMA_VERSION) {
-    throw new InvoiceValidationError(
-      `Unsupported DELETED.json schema version: ${String(value.schemaVersion)}`
-    );
-  }
-  if (value.hardDeleteIncomplete !== undefined && typeof value.hardDeleteIncomplete !== "boolean") {
-    throw new InvoiceValidationError("DELETED.json hard-delete state must be a boolean");
-  }
-  return {
-    schemaVersion: INVOICE_DELETION_SCHEMA_VERSION,
-    invoiceId: requiredString(value.invoiceId, "DELETED.json invoice id"),
-    invoiceName: requiredString(value.invoiceName, "DELETED.json invoice name"),
-    lastRevision: safeInteger(value.lastRevision, "DELETED.json last revision", 0),
-    deletedAt: canonicalIsoTimestamp(value.deletedAt, "DELETED.json deletion timestamp"),
-    ...(value.hardDeleteIncomplete === undefined
-      ? {}
-      : { hardDeleteIncomplete: value.hardDeleteIncomplete }),
-  };
-}
-
-function receiptSha256(value: unknown, label: string): string {
-  const sha256 = requiredString(value, label);
-  if (!/^[0-9a-f]{64}$/i.test(sha256)) {
-    throw new InvoiceValidationError(`${label} must be a 64-character hexadecimal value`);
-  }
-  return sha256.toLowerCase();
-}
-
-function validateReviewAcknowledgement(
-  value: unknown,
-  index: number
-): InvoiceReviewAcknowledgement {
-  const label = `Review acknowledgement ${index + 1}`;
-  if (!isRecord(value)) {
-    throw new InvoiceValidationError(`${label} must be an object`);
-  }
-  const fingerprint = requiredString(value.fingerprint, `${label} fingerprint`);
-  if (!/^[0-9a-f]{64}$/.test(fingerprint)) {
-    throw new InvoiceValidationError(`${label} fingerprint must be a lowercase SHA-256 value`);
-  }
-  const acknowledgedAt = canonicalIsoTimestamp(value.acknowledgedAt, `${label} timestamp`);
-  return { fingerprint, acknowledgedAt };
-}
-
-function managedRelativePath(
-  value: unknown,
-  requiredDirectory: "receipts" | "debug",
-  label: string
-): string {
-  const candidate = requiredString(value, label);
-  if (candidate.includes("\0") || path.isAbsolute(candidate)) {
-    throw new InvoiceValidationError(`${label} must be a relative managed path`);
-  }
-  const normalized = path.normalize(candidate);
-  const relative = path.relative(requiredDirectory, normalized);
-  if (
-    relative === "" ||
-    relative.startsWith(`..${path.sep}`) ||
-    relative === ".." ||
-    path.isAbsolute(relative)
-  ) {
-    throw new InvoiceValidationError(`${label} must stay inside ${requiredDirectory}/`);
-  }
-  return normalized;
-}
-
-function isIsoDate(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    return false;
-  }
-  const parsed = new Date(`${value}T00:00:00.000Z`);
-  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
-}
-
-function validatePeriod(value: unknown, label = "Invoice period"): InvoicePeriod {
-  if (!isRecord(value)) {
-    throw new InvoiceValidationError(`${label} must be an object`);
-  }
-  const startDate = requiredString(value.startDate, `${label} start date`);
-  const endDate = requiredString(value.endDate, `${label} end date`);
-  if (!isIsoDate(startDate) || !isIsoDate(endDate)) {
-    throw new InvoiceValidationError(`${label} dates must use valid YYYY-MM-DD values`);
-  }
-  if (startDate > endDate) {
-    throw new InvoiceValidationError(`${label} start date must not follow its end date`);
-  }
-  return { startDate, endDate };
-}
-
-function validateRow(value: unknown, index: number): InvoiceRow {
-  const label = `Invoice row ${index + 1}`;
-  if (!isRecord(value)) {
-    throw new InvoiceValidationError(`${label} must be an object`);
-  }
-
-  const date = nullableString(value.date, `${label} date`);
-  if (date !== null && !isIsoDate(date)) {
-    throw new InvoiceValidationError(`${label} date must use YYYY-MM-DD`);
-  }
-  const hours = requiredString(value.hours, `${label} hours`, true);
-  try {
-    normalizeHours(hours);
-  } catch (error) {
-    throw new InvoiceValidationError(
-      `${label} hours are invalid: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-
-  return {
-    id: requiredString(value.id, `${label} id`),
-    date,
-    groceriesMinor: nullableSafeInteger(value.groceriesMinor, `${label} groceries amount`),
-    hours,
-    rateMinor: nullableSafeInteger(value.rateMinor, `${label} rate`),
-    comment: requiredString(value.comment, `${label} comment`, true),
-    receiptId: nullableString(value.receiptId, `${label} receipt id`),
-  };
-}
-
-function validateReceipt(value: unknown, index: number): ReceiptRecord {
-  const label = `Receipt ${index + 1}`;
-  if (!isRecord(value) || !isRecord(value.source)) {
-    throw new InvoiceValidationError(`${label} must be an object with a source`);
-  }
-
-  const kind = requiredString(value.source.kind, `${label} source kind`) as SourceKind;
-  const method = requiredString(value.source.method, `${label} import method`) as ImportMethod;
-  const status = requiredString(value.status, `${label} status`) as ReceiptStatus;
-  if (!SOURCE_KINDS.has(kind) || !IMPORT_METHODS.has(method)) {
-    throw new InvoiceValidationError(`${label} has invalid source metadata`);
-  }
-  if (!RECEIPT_STATUSES.has(status)) {
-    throw new InvoiceValidationError(`${label} has an invalid status`);
-  }
-
-  const receipt: ReceiptRecord = {
-    id: requiredString(value.id, `${label} id`),
-    relativePath: managedRelativePath(value.relativePath, "receipts", `${label} relative path`),
-    debugPath: managedRelativePath(value.debugPath, "debug", `${label} debug path`),
-    originalFilename: requiredString(value.originalFilename, `${label} original filename`),
-    mimeType: requiredString(value.mimeType, `${label} MIME type`),
-    sha256: receiptSha256(value.sha256, `${label} SHA-256`),
-    source: { kind, method },
-    status,
-    importedAt: canonicalIsoTimestamp(value.importedAt, `${label} imported at`),
-  };
-  if (value.error !== undefined) {
-    receipt.error = requiredString(value.error, `${label} error`, true);
-  }
-  return receipt;
-}
-
-export function validateInvoiceDocument(value: unknown): InvoiceDocument {
-  if (!isRecord(value)) {
-    throw new InvoiceValidationError("Invoice JSON must contain an object");
-  }
-  if (value.schemaVersion !== INVOICE_SCHEMA_VERSION) {
-    throw new InvoiceValidationError(
-      `Unsupported invoice schema version: ${String(value.schemaVersion)}`
-    );
-  }
-  if (!Array.isArray(value.rows) || !Array.isArray(value.receipts)) {
-    throw new InvoiceValidationError("Invoice rows and receipts must be arrays");
-  }
-
-  const rows = value.rows.map(validateRow);
-  const receipts = value.receipts.map(validateReceipt);
-  const reviewAcknowledgements =
-    value.reviewAcknowledgements === undefined
-      ? []
-      : Array.isArray(value.reviewAcknowledgements)
-        ? value.reviewAcknowledgements.map(validateReviewAcknowledgement)
-        : (() => {
-            throw new InvoiceValidationError("Invoice review acknowledgements must be an array");
-          })();
-  if (new Set(rows.map((row) => row.id)).size !== rows.length) {
-    throw new InvoiceValidationError("Invoice row IDs must be unique");
-  }
-  if (new Set(receipts.map((receipt) => receipt.id)).size !== receipts.length) {
-    throw new InvoiceValidationError("Receipt IDs must be unique");
-  }
-  if (
-    new Set(reviewAcknowledgements.map(({ fingerprint }) => fingerprint)).size !==
-    reviewAcknowledgements.length
-  ) {
-    throw new InvoiceValidationError("Invoice review acknowledgement fingerprints must be unique");
-  }
-  if (
-    new Set(receipts.map((receipt) => receipt.relativePath)).size !== receipts.length ||
-    new Set(receipts.map((receipt) => receipt.debugPath)).size !== receipts.length
-  ) {
-    throw new InvoiceValidationError("Managed receipt and debug paths must be unique");
-  }
-  const receiptIds = new Set(receipts.map((receipt) => receipt.id));
-  const rowReceiptIds = rows
-    .map((row) => row.receiptId)
-    .filter((receiptId): receiptId is string => receiptId !== null);
-  if (new Set(rowReceiptIds).size !== rowReceiptIds.length) {
-    throw new InvoiceValidationError("A receipt can belong to only one invoice row");
-  }
-  if (rowReceiptIds.some((receiptId) => !receiptIds.has(receiptId))) {
-    throw new InvoiceValidationError("Invoice rows cannot reference missing receipts");
-  }
-  if (value.currency !== "USD") {
-    throw new InvoiceValidationError("Invoice currency must be USD");
-  }
-
-  return {
-    schemaVersion: INVOICE_SCHEMA_VERSION,
-    id: requiredString(value.id, "Invoice id"),
-    name: requiredString(value.name, "Invoice name"),
-    period: validatePeriod(value.period),
-    defaultRateMinor: safeInteger(value.defaultRateMinor, "Default rate", 0),
-    currency: "USD",
-    revision: safeInteger(value.revision, "Invoice revision", 0),
-    rows,
-    receipts,
-    reviewAcknowledgements,
-    createdAt: canonicalIsoTimestamp(value.createdAt, "Invoice created timestamp"),
-    updatedAt: canonicalIsoTimestamp(value.updatedAt, "Invoice updated timestamp"),
-  };
-}
-
-function cloneInvoice(invoice: InvoiceDocument): InvoiceDocument {
-  return structuredClone(invoice);
-}
-
-function isErrno(error: unknown, code: string): boolean {
-  return isRecord(error) && error.code === code;
-}
-
-async function exists(filename: string): Promise<boolean> {
-  try {
-    await fs.access(filename, fsConstants.F_OK);
-    return true;
-  } catch (error) {
-    if (isErrno(error, "ENOENT")) {
-      return false;
-    }
-    throw error;
-  }
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
-  try {
-    handle = await fs.open(directory, "r");
-    await handle.sync();
-  } catch (error) {
-    // Directory fsync is not available on every platform/filesystem. The files
-    // themselves have already been synced, so only ignore those platform cases.
-    if (
-      !isErrno(error, "EINVAL") &&
-      !isErrno(error, "ENOTSUP") &&
-      !isErrno(error, "EISDIR") &&
-      !isErrno(error, "EBADF")
-    ) {
-      throw error;
-    }
-  } finally {
-    await handle?.close();
-  }
-}
-
-async function atomicWriteFile(
-  filename: string,
-  contents: string | Buffer,
-  options: { mode: number; retainBackup?: boolean }
-): Promise<void> {
-  const directory = path.dirname(filename);
-  const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.mkdir(directory, { recursive: true });
-
-  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
-  let renamed = false;
-  try {
-    handle = await fs.open(temporary, "wx", options.mode);
-    await handle.chmod(options.mode);
-    await handle.writeFile(contents);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-
-    if (options.retainBackup && (await exists(filename))) {
-      const previous = await fs.readFile(filename);
-      await atomicWriteFile(`${filename}.bak`, previous, { mode: options.mode });
-    }
-
-    await fs.rename(temporary, filename);
-    renamed = true;
-    // The rename is the caller-visible commit point. A directory-sync failure
-    // can make crash durability uncertain, but must not turn a committed write
-    // into a reported failure that causes higher-level file rollbacks.
-    await syncDirectory(directory).catch(() => undefined);
-  } finally {
-    await handle?.close();
-    if (!renamed) {
-      await fs.rm(temporary, { force: true }).catch(() => undefined);
-    }
-  }
 }
 
 async function ensureOrdinaryDirectory(directory: string, label: string): Promise<void> {
@@ -506,7 +179,8 @@ function deletionWarning(): string {
 }
 
 export class InvoiceStore {
-  private readonly queues = new Map<string, Promise<void>>();
+  private readonly invoiceOperations = new KeyedSerialQueue<string>();
+  private readonly aliasesByBase = new Map<string, Map<string, string>>();
   private admissionTail: Promise<void> = Promise.resolve();
   private readonly now: () => Date;
   private readonly idFactory: () => string;
@@ -542,19 +216,72 @@ export class InvoiceStore {
     return resolved;
   }
 
-  private enqueue<T>(key: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.queues.get(key) ?? Promise.resolve();
-    const result = previous.catch(() => undefined).then(operation);
-    const tail = result.then(
-      () => undefined,
-      () => undefined
-    );
-    this.queues.set(key, tail);
-    return result.finally(() => {
-      if (this.queues.get(key) === tail) {
-        this.queues.delete(key);
+  private aliasesForBase(base: string): Map<string, string> {
+    let aliases = this.aliasesByBase.get(base);
+    if (!aliases) {
+      aliases = new Map();
+      this.aliasesByBase.set(base, aliases);
+    }
+    return aliases;
+  }
+
+  private cacheInvoice(base: string, folder: string, invoice: InvoiceDocument): void {
+    const resolvedFolder = path.resolve(folder);
+    if (path.dirname(resolvedFolder) !== base) return;
+
+    const aliases = this.aliasesForBase(base);
+    for (const [alias, cachedFolder] of aliases) {
+      if (cachedFolder === resolvedFolder) aliases.delete(alias);
+    }
+    aliases.set(invoice.id, resolvedFolder);
+    aliases.set(invoice.name, resolvedFolder);
+  }
+
+  private evictInvoiceFolder(base: string, folder: string): void {
+    const aliases = this.aliasesByBase.get(base);
+    if (!aliases) return;
+    const resolvedFolder = path.resolve(folder);
+    for (const [alias, cachedFolder] of aliases) {
+      if (cachedFolder === resolvedFolder) aliases.delete(alias);
+    }
+    if (aliases.size === 0) this.aliasesByBase.delete(base);
+  }
+
+  private rebuildAliasCache(base: string, invoices: readonly DiscoveredInvoice[]): void {
+    const aliases = new Map<string, string>();
+    for (const { folder, invoice } of invoices) {
+      aliases.set(invoice.id, folder);
+      aliases.set(invoice.name, folder);
+    }
+    this.aliasesByBase.set(base, aliases);
+  }
+
+  private async readCachedInvoice(
+    base: string,
+    invoiceAlias: string
+  ): Promise<DiscoveredInvoice | null> {
+    const folder = this.aliasesByBase.get(base)?.get(invoiceAlias);
+    if (!folder) return null;
+    if (path.dirname(folder) !== base) {
+      this.evictInvoiceFolder(base, folder);
+      return null;
+    }
+
+    try {
+      const folderMetadata = await fs.lstat(folder);
+      if (folderMetadata.isSymbolicLink() || !folderMetadata.isDirectory()) {
+        throw new InvoiceValidationError(`Path must be an ordinary invoice folder: ${folder}`);
       }
-    });
+      const invoice = await this.readInvoiceFile(folder);
+      this.cacheInvoice(base, folder, invoice);
+      return invoice.id === invoiceAlias || invoice.name === invoiceAlias
+        ? { folder, invoice }
+        : null;
+    } catch (error) {
+      this.evictInvoiceFolder(base, folder);
+      if (isErrno(error, "ENOENT")) return null;
+      throw error;
+    }
   }
 
   private invoiceQueueKey(folder: string): string {
@@ -576,7 +303,7 @@ export class InvoiceStore {
       .catch(() => undefined)
       .then(async () => {
         const { folder } = await this.findInvoice(invoiceId);
-        queued = this.enqueue(this.invoiceQueueKey(folder), () => operation(folder));
+        queued = this.invoiceOperations.run(this.invoiceQueueKey(folder), () => operation(folder));
       });
     this.admissionTail = admission.then(
       () => undefined,
@@ -650,8 +377,8 @@ export class InvoiceStore {
     return invoice;
   }
 
-  private async discoverInvoices(): Promise<DiscoveredInvoice[]> {
-    const base = await this.baseFolder();
+  private async discoverInvoices(baseValue?: string): Promise<DiscoveredInvoice[]> {
+    const base = baseValue ?? (await this.baseFolder());
     const entries = await fs.readdir(base, { withFileTypes: true });
     const discovered: DiscoveredInvoice[] = [];
 
@@ -664,7 +391,7 @@ export class InvoiceStore {
         if (await this.readDeletionSentinel(folder)) {
           continue;
         }
-        if (!(await exists(path.join(folder, "invoice.json")))) {
+        if (!(await fileExists(path.join(folder, "invoice.json")))) {
           continue;
         }
         discovered.push({ folder, invoice: await this.readInvoiceFile(folder) });
@@ -676,26 +403,46 @@ export class InvoiceStore {
         }
       }
     }
+    this.rebuildAliasCache(base, discovered);
     return discovered;
   }
 
   private async findInvoice(invoiceId: string): Promise<DiscoveredInvoice> {
     const base = await this.baseFolder();
+    const cached = await this.readCachedInvoice(base, invoiceId);
+    if (cached) {
+      return cached;
+    }
+
     const directFolder = path.join(base, invoiceId);
     if (path.dirname(directFolder) === base) {
-      const deletion = await this.readDeletionSentinel(directFolder);
-      if (deletion && (deletion.invoiceId === invoiceId || deletion.invoiceName === invoiceId)) {
-        throw new InvoiceDeletedError(deletion);
+      let metadata: Awaited<ReturnType<typeof fs.lstat>> | undefined;
+      try {
+        metadata = await fs.lstat(directFolder);
+      } catch (error) {
+        if (!isErrno(error, "ENOENT")) throw error;
       }
-      if (await exists(path.join(directFolder, "invoice.json"))) {
-        const invoice = await this.readInvoiceFile(directFolder);
-        if (invoice.id === invoiceId || invoice.name === invoiceId) {
-          return { folder: directFolder, invoice };
+      if (metadata) {
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          throw new InvoiceValidationError(
+            `Path must be an ordinary invoice folder: ${directFolder}`
+          );
+        }
+        const deletion = await this.readDeletionSentinel(directFolder);
+        if (deletion && (deletion.invoiceId === invoiceId || deletion.invoiceName === invoiceId)) {
+          throw new InvoiceDeletedError(deletion);
+        }
+        if (await fileExists(path.join(directFolder, "invoice.json"))) {
+          const invoice = await this.readInvoiceFile(directFolder);
+          this.cacheInvoice(base, directFolder, invoice);
+          if (invoice.id === invoiceId || invoice.name === invoiceId) {
+            return { folder: directFolder, invoice };
+          }
         }
       }
     }
 
-    const match = (await this.discoverInvoices()).find(
+    const match = (await this.discoverInvoices(base)).find(
       ({ invoice }) => invoice.id === invoiceId || invoice.name === invoiceId
     );
     if (match) {
@@ -717,17 +464,29 @@ export class InvoiceStore {
 
   private async writeViews(folder: string, invoice: InvoiceDocument): Promise<void> {
     const exportOptions = { includeHeaders: true, includeTotals: true } as const;
-    const results = await Promise.allSettled([
-      atomicWriteFile(path.join(folder, "invoice.tsv"), invoiceToTsv(invoice, exportOptions), {
-        mode: 0o644,
-      }),
-      atomicWriteFile(path.join(folder, "invoice.csv"), invoiceToCsv(invoice, exportOptions), {
-        mode: 0o644,
-      }),
-    ]);
-    const failures = results.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : []
-    );
+    const writes = [
+      atomicWriteFile(
+        path.join(folder, INVOICE_VIEW_FILENAMES[0]),
+        invoiceToTsv(invoice, exportOptions),
+        {
+          mode: 0o644,
+        }
+      ),
+      atomicWriteFile(
+        path.join(folder, INVOICE_VIEW_FILENAMES[1]),
+        invoiceToCsv(invoice, exportOptions),
+        {
+          mode: 0o644,
+        }
+      ),
+    ];
+    const results = await Promise.allSettled(writes);
+    const failures = results.flatMap((result, index) => {
+      if (result.status === "rejected") return [result.reason];
+      return result.value.directorySynced
+        ? []
+        : [new Error(`Could not durably replace ${INVOICE_VIEW_FILENAMES[index]}`)];
+    });
     if (failures.length === 1) {
       throw failures[0];
     }
@@ -736,15 +495,138 @@ export class InvoiceStore {
     }
   }
 
+  private async writeViewState(
+    folder: string,
+    invoice: InvoiceDocument,
+    state: InvoiceViewState["state"]
+  ): Promise<boolean> {
+    const result = await atomicWriteFile(
+      path.join(folder, INVOICE_VIEW_STATE_FILENAME),
+      serializeInvoiceViewState({
+        schemaVersion: INVOICE_VIEW_STATE_SCHEMA_VERSION,
+        revision: invoice.revision,
+        invoiceSha256: invoiceDocumentFingerprint(invoice),
+        state,
+      }),
+      { mode: 0o600 }
+    );
+    return result.directorySynced;
+  }
+
+  private async beginViewWrite(folder: string, invoice: InvoiceDocument): Promise<void> {
+    if (!(await this.writeViewState(folder, invoice, "dirty"))) {
+      throw new Error("Could not establish a durable invoice view update marker");
+    }
+  }
+
+  private async writeViewsWithState(folder: string, invoice: InvoiceDocument): Promise<void> {
+    await this.beginViewWrite(folder, invoice);
+    await this.writeViews(folder, invoice);
+    await this.writeViewState(folder, invoice, "clean");
+  }
+
   private async writeInvoice(folder: string, invoice: InvoiceDocument): Promise<void> {
-    const json = `${JSON.stringify(invoice, null, 2)}\n`;
     // invoice.json is authoritative. Write the replaceable views first so a
     // rejected operation always leaves the authoritative revision unchanged.
+    await this.beginViewWrite(folder, invoice);
     await this.writeViews(folder, invoice);
-    await atomicWriteFile(path.join(folder, "invoice.json"), json, {
-      mode: 0o600,
-      retainBackup: true,
-    });
+    const invoiceWrite = await atomicWriteFile(
+      path.join(folder, "invoice.json"),
+      serializeInvoiceDocument(invoice),
+      {
+        mode: 0o600,
+        retainBackup: true,
+      }
+    );
+    // The JSON rename above is the authoritative commit point. A failed clean
+    // marker must not report the committed mutation as rejected; the dirty
+    // marker deliberately makes the next bounded repair retry the views.
+    if (invoiceWrite.directorySynced) {
+      await this.writeViewState(folder, invoice, "clean").catch(() => undefined);
+    }
+  }
+
+  private async readViewState(folder: string): Promise<InvoiceViewState | null> {
+    const filename = path.join(folder, INVOICE_VIEW_STATE_FILENAME);
+    try {
+      const metadata = await fs.lstat(filename);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) return null;
+      return validateInvoiceViewState(JSON.parse(await fs.readFile(filename, "utf8")));
+    } catch {
+      return null;
+    }
+  }
+
+  private async hasOrdinaryViews(folder: string): Promise<boolean> {
+    const metadata = await Promise.all(
+      INVOICE_VIEW_FILENAMES.map(async (filename) => {
+        try {
+          return await fs.lstat(path.join(folder, filename));
+        } catch {
+          return null;
+        }
+      })
+    );
+    return metadata.every((item) => item !== null && !item.isSymbolicLink() && item.isFile());
+  }
+
+  private async viewsAreCurrent(folder: string, invoice: InvoiceDocument): Promise<boolean> {
+    const [state, hasViews] = await Promise.all([
+      this.readViewState(folder),
+      this.hasOrdinaryViews(folder),
+    ]);
+    return (
+      state?.state === "clean" &&
+      state.revision === invoice.revision &&
+      state.invoiceSha256 === invoiceDocumentFingerprint(invoice) &&
+      hasViews
+    );
+  }
+
+  private async repairViewsInFolder(folder: string): Promise<boolean> {
+    const invoice = await this.readInvoiceFile(folder);
+    if (await this.viewsAreCurrent(folder, invoice)) return false;
+
+    await this.writeViewsWithState(folder, invoice);
+    return true;
+  }
+
+  private async repairDiscoveredViews(
+    invoices: readonly DiscoveredInvoice[]
+  ): Promise<InvoiceViewRepairReport> {
+    const outcomes = await mapBounded(
+      invoices,
+      INVOICE_VIEW_REPAIR_CONCURRENCY,
+      async ({ folder, invoice }) => {
+        try {
+          const repaired = await this.invoiceOperations.run(
+            this.invoiceQueueKey(folder),
+            async () => {
+              // Discovery already validated this authoritative revision. Checking
+              // its marker inside the invoice queue avoids a race with mutations
+              // without re-reading clean invoice JSON on the normal fast path.
+              if (await this.viewsAreCurrent(folder, invoice)) return false;
+              return this.repairViewsInFolder(folder);
+            }
+          );
+          return { repaired, invoice, message: null };
+        } catch (error) {
+          return {
+            repaired: false,
+            invoice,
+            message:
+              error instanceof Error ? error.message : "Unexpected invoice view repair error.",
+          };
+        }
+      }
+    );
+    return {
+      checked: outcomes.length,
+      repaired: outcomes.filter(({ repaired }) => repaired).length,
+      failures: outcomes.flatMap(({ invoice, message }) =>
+        message === null ? [] : [{ invoiceId: invoice.id, invoiceName: invoice.name, message }]
+      ),
+    };
   }
 
   private async ensureInvoiceDirectories(folder: string): Promise<void> {
@@ -883,7 +765,7 @@ export class InvoiceStore {
       }
       await atomicWriteFile(
         path.join(realFolder, "DELETED.json"),
-        `${JSON.stringify(deletion, null, 2)}\n`,
+        serializeInvoiceDeletionSentinel(deletion),
         { mode: 0o600 }
       );
     } catch {
@@ -894,6 +776,7 @@ export class InvoiceStore {
 
   async listInvoices(): Promise<InvoiceSummary[]> {
     const invoices = await this.discoverInvoices();
+    await this.repairDiscoveredViews(invoices);
     return invoices
       .map(({ invoice }) => ({
         id: invoice.id,
@@ -920,8 +803,8 @@ export class InvoiceStore {
     const base = await this.baseFolder();
     const folder = path.join(base, name);
 
-    return this.enqueue(this.invoiceQueueKey(folder), async () => {
-      if (await exists(folder)) {
+    return this.invoiceOperations.run(this.invoiceQueueKey(folder), async () => {
+      if (await fileExists(folder)) {
         await ensureOrdinaryDirectory(folder, "Invoice folder");
         const deletion = await this.readDeletionSentinel(folder);
         if (deletion) {
@@ -929,7 +812,7 @@ export class InvoiceStore {
         }
       }
       const invoiceFilename = path.join(folder, "invoice.json");
-      if (await exists(invoiceFilename)) {
+      if (await fileExists(invoiceFilename)) {
         const existing = await this.readInvoiceFile(folder);
         if (
           existing.name !== name ||
@@ -939,11 +822,12 @@ export class InvoiceStore {
           throw new InvoiceValidationError(`Existing ${name} contains a different invoice period`);
         }
         await this.ensureInvoiceDirectories(folder);
-        await this.writeViews(folder, existing);
-        return cloneInvoice(existing);
+        await this.writeViewsWithState(folder, existing);
+        this.cacheInvoice(base, folder, existing);
+        return cloneInvoiceDocument(existing);
       }
 
-      if (await exists(folder)) {
+      if (await fileExists(folder)) {
         const contents = await fs.readdir(folder);
         if (contents.length > 0) {
           throw new InvoiceValidationError(
@@ -976,7 +860,8 @@ export class InvoiceStore {
       await fs.mkdir(folder, { recursive: true });
       await this.ensureInvoiceDirectories(folder);
       await this.writeInvoice(folder, validated);
-      return cloneInvoice(validated);
+      this.cacheInvoice(base, folder, validated);
+      return cloneInvoiceDocument(validated);
     });
   }
 
@@ -984,8 +869,8 @@ export class InvoiceStore {
     return this.enqueueByInvoiceAlias(invoiceId, async (folder) => {
       const current = await this.readInvoiceFile(folder);
       await this.ensureInvoiceDirectories(folder);
-      await this.writeViews(folder, current);
-      return cloneInvoice(current);
+      this.cacheInvoice(path.dirname(folder), folder, current);
+      return cloneInvoiceDocument(current);
     });
   }
 
@@ -1012,9 +897,10 @@ export class InvoiceStore {
       };
       await atomicWriteFile(
         path.join(canonical.folder, "DELETED.json"),
-        `${JSON.stringify(deletion, null, 2)}\n`,
+        serializeInvoiceDeletionSentinel(deletion),
         { mode: 0o600 }
       );
+      this.evictInvoiceFolder(path.dirname(folder), folder);
 
       if (!options.hardDelete) {
         return {
@@ -1081,7 +967,7 @@ export class InvoiceStore {
         throw new RevisionConflictError(current.id, expectedRevision, current.revision);
       }
 
-      const draft = cloneInvoice(current);
+      const draft = cloneInvoiceDocument(current);
       const returned = await mutator(draft);
       const candidate = validateInvoiceDocument(returned ?? draft);
       candidate.schemaVersion = INVOICE_SCHEMA_VERSION;
@@ -1093,7 +979,8 @@ export class InvoiceStore {
       candidate.updatedAt = this.now().toISOString();
 
       await this.writeInvoice(folder, candidate);
-      return cloneInvoice(candidate);
+      this.cacheInvoice(path.dirname(folder), folder, candidate);
+      return cloneInvoiceDocument(candidate);
     });
   }
 
@@ -1108,7 +995,7 @@ export class InvoiceStore {
       if (current.revision !== expectedRevision) {
         throw new RevisionConflictError(current.id, expectedRevision, current.revision);
       }
-      return operation(cloneInvoice(current), folder);
+      return operation(cloneInvoiceDocument(current), folder);
     });
   }
 
@@ -1168,7 +1055,12 @@ export class InvoiceStore {
       // invoice.json is authoritative. Re-read inside the invoice queue so a
       // stale caller object can never roll the generated views backwards.
       const current = await this.readInvoiceFile(folder);
-      await this.writeViews(folder, current);
+      await this.writeViewsWithState(folder, current);
     });
+  }
+
+  /** Explicit maintenance hook; normal startup reuses listInvoices' discovery pass. */
+  async repairDerivedViews(): Promise<InvoiceViewRepairReport> {
+    return this.repairDiscoveredViews(await this.discoverInvoices());
   }
 }

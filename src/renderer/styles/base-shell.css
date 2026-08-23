@@ -1,0 +1,489 @@
+:root {
+  color: #202521;
+  background: #f2efe8;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --green-950: #173b31;
+  --green-900: #234a3d;
+  --green-800: #2f5e4d;
+  --green-700: #3a705c;
+  --green-100: #e6f0eb;
+  --green-50: #f2f7f4;
+  --ink: #202521;
+  --ink-soft: #565d58;
+  --ink-faint: #69706b;
+  --warm-50: #fbfaf7;
+  --warm-100: #f5f2eb;
+  --warm-200: #e9e4da;
+  --warm-300: #d8d1c5;
+  --line: #dedbd3;
+  --white: #ffffff;
+  --red: #a83a35;
+  --red-soft: #f9e9e7;
+  --amber: #956516;
+  --amber-soft: #fff5dc;
+  --shadow-sm: 0 1px 2px rgb(26 35 29 / 8%);
+  --shadow-md: 0 12px 35px rgb(29 37 32 / 14%);
+  --focus: 0 0 0 2px #fff, 0 0 0 5px #1f664e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  min-width: 0;
+  color: var(--ink);
+  background: var(--warm-100);
+}
+
+button,
+input {
+  font: inherit;
+}
+
+/*
+ * hiddenInset removes the native title-bar surface. This empty handle fits
+ * entirely inside the sidebar's unused top inset and clears the traffic
+ * lights, so it cannot steal clicks, scrolling, selection, or file drops.
+ */
+.window-drag-region {
+  position: fixed;
+  z-index: 130;
+  top: 0;
+  left: 80px;
+  width: 130px;
+  height: 42px;
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+button {
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[href]:focus-visible,
+[role="gridcell"]:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
+button:disabled,
+input:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+.app-shell {
+  position: relative;
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  height: 100%;
+  background: var(--warm-100);
+}
+
+.app-shell--drawer-overlay::after {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  background: rgb(22 28 24 / 28%);
+  pointer-events: none;
+  content: "";
+}
+
+.sidebar {
+  z-index: 10;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  /* Keep sidebar content below the inset macOS window controls and drag handle. */
+  padding: 48px 14px 14px;
+  border-right: 1px solid #d6d3cc;
+  background: #ebe8e1;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 2px 7px 20px;
+}
+
+.brand-mark,
+.loading-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+  color: #fff;
+  background: var(--green-800);
+  font-family: Georgia, serif;
+  font-size: 18px;
+  font-weight: 700;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 14%);
+}
+
+.brand > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.brand strong {
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+
+.brand span:not(.brand-mark) {
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.new-invoice-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  border: 1px solid var(--green-900);
+  border-radius: 8px;
+  color: #fff;
+  background: var(--green-800);
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+
+.new-invoice-button:hover {
+  background: var(--green-900);
+}
+
+.new-invoice-button span {
+  font-size: 17px;
+  font-weight: 400;
+}
+
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 23px 8px 8px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.sidebar-heading span:last-child {
+  display: grid;
+  min-width: 20px;
+  height: 18px;
+  place-items: center;
+  border-radius: 9px;
+  background: rgb(44 75 62 / 9%);
+  font-size: 10px;
+}
+
+.invoice-list {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+
+.invoice-list-item {
+  display: grid;
+  width: 100%;
+  gap: 4px;
+  margin-bottom: 3px;
+  padding: 10px 11px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.invoice-list-item:hover {
+  background: rgb(255 255 255 / 53%);
+}
+
+.invoice-list-item.is-active {
+  border-color: #c5d4cc;
+  background: #f8faf8;
+  box-shadow: var(--shadow-sm);
+}
+
+.invoice-list-item strong {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.invoice-list-item > span {
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.invoice-list-item small {
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.invoice-list-item .invoice-list-importing {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--green-700);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.sidebar-empty {
+  padding: 11px 8px;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.settings-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--ink-soft);
+  background: transparent;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.settings-button:hover {
+  color: var(--ink);
+  background: rgb(255 255 255 / 55%);
+}
+
+.workspace {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: auto;
+  transition: margin-right 180ms ease;
+}
+
+.app-shell:has(.receipt-drawer) .workspace {
+  margin-right: 410px;
+}
+
+.key-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 24px;
+  border-bottom: 1px solid #ead7a8;
+  color: #6f521b;
+  background: var(--amber-soft);
+  font-size: 12px;
+}
+
+.workspace-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 24px;
+  border-bottom: 1px solid #e5c1bd;
+  color: #793b37;
+  background: var(--red-soft);
+  font-size: 12px;
+}
+
+.workspace-error > span {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--red);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.workspace-error p {
+  flex: 1;
+}
+
+.key-banner > span {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: #ad791e;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.key-banner p {
+  flex: 1;
+}
+
+.workspace-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 32px;
+  padding: 25px 28px 19px;
+}
+
+.workspace-title {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.eyebrow {
+  color: var(--green-700);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.workspace-title h1 {
+  overflow: hidden;
+  font-size: 25px;
+  font-weight: 690;
+  letter-spacing: -0.035em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-title > span {
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.workspace-summary {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgb(255 255 255 / 70%);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.workspace-summary > div {
+  display: grid;
+  min-width: 106px;
+  align-content: center;
+  gap: 2px;
+  padding: 9px 13px;
+  border-right: 1px solid var(--line);
+}
+
+.workspace-summary > div:last-child {
+  border-right: 0;
+}
+
+.workspace-summary span {
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.workspace-summary strong {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.workspace-summary .workspace-summary-total {
+  min-width: 124px;
+  color: #fff;
+  background: var(--green-800);
+}
+
+.workspace-summary-total span {
+  color: rgb(255 255 255 / 72%);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 0 28px 14px;
+}
+
+.toolbar-primary,
+.toolbar-secondary,
+.copy-invoice-actions,
+.inline-actions,
+.modal-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.copy-invoice-actions {
+  display: contents;
+}
+
+.toolbar-secondary {
+  margin-left: auto;
+  justify-content: flex-end;
+}

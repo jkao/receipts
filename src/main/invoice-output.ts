@@ -11,8 +11,10 @@ import {
   normalizeHours,
 } from "../shared/finance";
 import type { InvoiceDocument, InvoiceOutputResult, ReceiptRecord } from "../shared/types";
+import { mapBounded } from "./bounded-operations";
 import type { InvoiceStore } from "./invoice-store";
 import { resolveInside, sha256File } from "./receipt-files";
+import { KeyedSerialQueue } from "./serial-queue";
 
 type OutputStore = Pick<InvoiceStore, "loadInvoice" | "getInvoiceFolder" | "runAtRevision">;
 
@@ -31,9 +33,10 @@ interface VerifiedReceipt {
 }
 
 const VALID_SHA256 = /^[0-9a-f]{64}$/;
+export const OUTPUT_FILE_CONCURRENCY = 4;
 
 export class InvoiceOutputBuilder {
-  private readonly queues = new Map<string, Promise<void>>();
+  private readonly operations = new KeyedSerialQueue<string>();
   private readonly renderPdf: InvoicePdfRenderer;
   private readonly revealPath: (folder: string) => Promise<string | undefined>;
   private readonly nonce: () => string;
@@ -48,7 +51,7 @@ export class InvoiceOutputBuilder {
   }
 
   async buildInvoiceOutput(invoiceId: string): Promise<InvoiceOutputResult> {
-    return this.enqueue(invoiceId, async () => {
+    return this.operations.run(invoiceId, async () => {
       const invoice = await this.invoices.loadInvoice(invoiceId);
       const invoiceFolder = await this.invoices.getInvoiceFolder(invoice.name);
       const verified = await verifyManagedReceipts(invoice, invoiceFolder);
@@ -83,7 +86,7 @@ export class InvoiceOutputBuilder {
   }
 
   async revealOutput(invoiceId: string): Promise<void> {
-    return this.enqueue(invoiceId, async () => {
+    return this.operations.run(invoiceId, async () => {
       const invoiceFolder = await this.invoices.getInvoiceFolder(invoiceId);
       const outputPath = path.join(invoiceFolder, "output");
       let metadata: Awaited<ReturnType<typeof fs.lstat>>;
@@ -101,21 +104,6 @@ export class InvoiceOutputBuilder {
       const error = await this.revealPath(outputPath);
       if (typeof error === "string" && error) {
         throw new Error(error);
-      }
-    });
-  }
-
-  private enqueue<T>(key: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.queues.get(key) ?? Promise.resolve();
-    const result = previous.catch(() => undefined).then(operation);
-    const tail = result.then(
-      () => undefined,
-      () => undefined
-    );
-    this.queues.set(key, tail);
-    return result.finally(() => {
-      if (this.queues.get(key) === tail) {
-        this.queues.delete(key);
       }
     });
   }
@@ -268,8 +256,7 @@ async function verifyManagedReceipts(
   invoice: InvoiceDocument,
   invoiceFolder: string
 ): Promise<VerifiedReceipt[]> {
-  const verified: VerifiedReceipt[] = [];
-  for (const receipt of invoice.receipts) {
+  return mapBounded(invoice.receipts, OUTPUT_FILE_CONCURRENCY, async (receipt) => {
     const expected = receipt.sha256.trim().toLowerCase();
     if (!VALID_SHA256.test(expected)) {
       throw new Error(`Receipt ${receipt.originalFilename} has an invalid SHA-256 value.`);
@@ -291,9 +278,8 @@ async function verifyManagedReceipts(
     if (actual !== expected) {
       throw new Error(`Receipt ${receipt.originalFilename} does not match its saved SHA-256.`);
     }
-    verified.push({ receipt, sha256: expected, sourcePath });
-  }
-  return verified;
+    return { receipt, sha256: expected, sourcePath };
+  });
 }
 
 function firstReceiptForEachHash(receipts: VerifiedReceipt[]): VerifiedReceipt[] {
@@ -319,13 +305,14 @@ async function buildStagedOutput(
   });
 
   const usedNames = new Set<string>();
-  for (const receipt of receipts) {
-    const filename = availableReceiptName(
-      path.basename(receipt.receipt.relativePath),
-      receipt.sha256,
-      usedNames
-    );
-    const destination = path.join(receiptFolder, filename);
+  const copies = receipts.map((receipt) => ({
+    destination: path.join(
+      receiptFolder,
+      availableReceiptName(path.basename(receipt.receipt.relativePath), receipt.sha256, usedNames)
+    ),
+    receipt,
+  }));
+  await mapBounded(copies, OUTPUT_FILE_CONCURRENCY, async ({ destination, receipt }) => {
     const sourceMetadata = await fs.lstat(receipt.sourcePath);
     if (sourceMetadata.isSymbolicLink() || !sourceMetadata.isFile()) {
       throw new Error(`Receipt ${receipt.receipt.originalFilename} is not an ordinary file.`);
@@ -336,7 +323,7 @@ async function buildStagedOutput(
         `Receipt ${receipt.receipt.originalFilename} changed while output was being built.`
       );
     }
-  }
+  });
 }
 
 async function replaceOutputDirectory(

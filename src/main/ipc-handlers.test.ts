@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { IpcWireResult } from "../shared/app-error";
 import { IPC } from "../shared/ipc";
 
 const electron = vi.hoisted(() => {
@@ -26,6 +27,14 @@ vi.mock("electron", () => ({
 
 import { registerIpcHandlers } from "./ipc-handlers";
 
+async function invoke<Value>(channel: string, ...args: unknown[]): Promise<Value> {
+  const handler = electron.handlers.get(channel);
+  if (!handler) throw new Error(`Missing IPC handler for ${channel}.`);
+  const result = (await handler({}, ...args)) as IpcWireResult<Value>;
+  if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
+  return result.value;
+}
+
 describe("receipt picker IPC", () => {
   beforeEach(() => {
     electron.handlers.clear();
@@ -47,9 +56,7 @@ describe("receipt picker IPC", () => {
       getWindow: () => window as never,
     });
 
-    const handler = electron.handlers.get(IPC.receiptsChoose);
-    expect(handler).toBeDefined();
-    await expect(handler?.({})).resolves.toEqual(paths);
+    await expect(invoke(IPC.receiptsChoose)).resolves.toEqual(paths);
     expect(electron.showOpenDialog).toHaveBeenCalledWith(
       window,
       expect.objectContaining({
@@ -74,8 +81,35 @@ describe("receipt picker IPC", () => {
       getWindow: () => ({}) as never,
     });
 
-    const handler = electron.handlers.get(IPC.receiptsChoose);
-    await expect(handler?.({})).resolves.toEqual([]);
+    await expect(invoke(IPC.receiptsChoose)).resolves.toEqual([]);
+  });
+
+  it("delegates background import start and cancellation through structured IPC", async () => {
+    const started = { jobId: "import-1", importedCount: 1 };
+    const cancelled = { jobId: "import-1", cancelled: true };
+    const startImport = vi.fn().mockResolvedValue(started);
+    const cancelImport = vi.fn().mockReturnValue(cancelled);
+    registerIpcHandlers({
+      settings: {} as never,
+      invoices: {} as never,
+      checker: {} as never,
+      importer: { startImport, cancelImport } as never,
+      trash: {} as never,
+      exporter: {} as never,
+      output: {} as never,
+      getWindow: () => ({}) as never,
+    });
+    const paths = ["/receipts/background.jpg"];
+    const options = { method: "drag-drop" as const };
+
+    await expect(
+      electron.handlers.get(IPC.receiptsImportStart)?.({}, "invoice-1", paths, options)
+    ).resolves.toEqual({ ok: true, value: started });
+    expect(startImport).toHaveBeenCalledWith("invoice-1", paths, options);
+    await expect(
+      electron.handlers.get(IPC.receiptsImportCancel)?.({}, "import-1")
+    ).resolves.toEqual({ ok: true, value: cancelled });
+    expect(cancelImport).toHaveBeenCalledWith("import-1");
   });
 
   it("delegates advisory invoice checks through IPC", async () => {
@@ -97,8 +131,7 @@ describe("receipt picker IPC", () => {
       getWindow: () => ({}) as never,
     });
 
-    const handler = electron.handlers.get(IPC.invoicesCheck);
-    await expect(handler?.({}, "invoice-1")).resolves.toBe(result);
+    await expect(invoke(IPC.invoicesCheck, "invoice-1")).resolves.toBe(result);
     expect(checkInvoice).toHaveBeenCalledWith("invoice-1");
   });
 
@@ -122,9 +155,7 @@ describe("receipt picker IPC", () => {
     });
     const options = { expectedRevision: 7, hardDelete: true };
 
-    await expect(
-      electron.handlers.get(IPC.invoicesRemove)?.({}, "invoice-1", options)
-    ).resolves.toBe(result);
+    await expect(invoke(IPC.invoicesRemove, "invoice-1", options)).resolves.toBe(result);
     expect(removeInvoice).toHaveBeenCalledWith("invoice-1", options);
   });
 
@@ -144,13 +175,7 @@ describe("receipt picker IPC", () => {
     const fingerprint = "a".repeat(64);
 
     await expect(
-      electron.handlers.get(IPC.invoicesSetReviewAcknowledgement)?.(
-        {},
-        "invoice-1",
-        fingerprint,
-        true,
-        3
-      )
+      invoke(IPC.invoicesSetReviewAcknowledgement, "invoice-1", fingerprint, true, 3)
     ).resolves.toBe(result);
     expect(setReviewAcknowledgement).toHaveBeenCalledWith("invoice-1", fingerprint, true, 3);
   });
@@ -170,14 +195,31 @@ describe("receipt picker IPC", () => {
       getWindow: () => ({}) as never,
     });
 
-    await expect(electron.handlers.get(IPC.invoiceBuildOutput)?.({}, "invoice-1")).resolves.toBe(
-      result
-    );
+    await expect(invoke(IPC.invoiceBuildOutput, "invoice-1")).resolves.toBe(result);
     expect(buildInvoiceOutput).toHaveBeenCalledWith("invoice-1");
 
-    await expect(
-      electron.handlers.get(IPC.invoiceRevealOutput)?.({}, "invoice-1")
-    ).resolves.toBeUndefined();
+    await expect(invoke(IPC.invoiceRevealOutput, "invoice-1")).resolves.toBeUndefined();
     expect(revealOutput).toHaveBeenCalledWith("invoice-1");
+  });
+
+  it("returns stable error codes without relying on Electron's Error serialization", async () => {
+    const conflict = Object.assign(new Error("Invoice changed on disk."), {
+      name: "RevisionConflictError",
+    });
+    registerIpcHandlers({
+      settings: {} as never,
+      invoices: { loadInvoice: vi.fn().mockRejectedValue(conflict) } as never,
+      checker: {} as never,
+      importer: {} as never,
+      trash: {} as never,
+      exporter: {} as never,
+      output: {} as never,
+      getWindow: () => ({}) as never,
+    });
+
+    await expect(electron.handlers.get(IPC.invoicesLoad)?.({}, "invoice-1")).resolves.toEqual({
+      ok: false,
+      error: { code: "REVISION_CONFLICT", message: "Invoice changed on disk." },
+    });
   });
 });

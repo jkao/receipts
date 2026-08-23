@@ -188,7 +188,12 @@ export class OpenAiReceiptClient {
     }
   }
 
-  async extract(buffer: Buffer, filename: string, mimeType: string): Promise<OpenAiReceiptResult> {
+  async extract(
+    buffer: Buffer,
+    filename: string,
+    mimeType: string,
+    signal?: AbortSignal
+  ): Promise<OpenAiReceiptResult> {
     if (!this.apiKey) {
       throw new OpenAiReceiptError("An OpenAI API key is required.");
     }
@@ -231,7 +236,9 @@ export class OpenAiReceiptClient {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(EXTRACTION_TIMEOUT_MS),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(EXTRACTION_TIMEOUT_MS)])
+          : AbortSignal.timeout(EXTRACTION_TIMEOUT_MS),
       });
     } catch (error) {
       throw new OpenAiReceiptError(`Could not reach OpenAI: ${this.safeErrorMessage(error)}`);

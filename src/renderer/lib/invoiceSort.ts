@@ -72,6 +72,27 @@ export function rowsHaveSameOrder(
   return left.length === right.length && left.every((row, index) => row.id === right[index]?.id);
 }
 
+/**
+ * Fast path for grid edits: only re-run the O(n log n) sort when row identity
+ * or the value used by the active sort actually changed.
+ */
+export function rowsNeedResort(
+  previous: readonly InvoiceRow[],
+  next: readonly InvoiceRow[],
+  requestedSort: readonly SortColumn[]
+): boolean {
+  if (previous.length !== next.length) return true;
+  const [{ columnKey }] = normalizeInvoiceSort(requestedSort);
+  return previous.some((row, index) => {
+    const nextRow = next[index];
+    return (
+      !nextRow ||
+      row.id !== nextRow.id ||
+      !Object.is(valueForColumn(row, columnKey), valueForColumn(nextRow, columnKey))
+    );
+  });
+}
+
 function valueForColumn(row: InvoiceRow, columnKey: string): SortValue {
   switch (columnKey) {
     case "date":

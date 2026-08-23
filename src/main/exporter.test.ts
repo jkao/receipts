@@ -23,7 +23,15 @@ vi.mock("electron", () => ({
   shell: { openPath: electronMocks.openPath },
 }));
 
-import { InvoiceExporter } from "./exporter";
+import { EXPORT_FILE_CONCURRENCY, InvoiceExporter } from "./exporter";
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 describe("InvoiceExporter receipt preview", () => {
   let baseFolder: string;
@@ -99,6 +107,39 @@ describe("InvoiceExporter receipt preview", () => {
     ).rejects.toThrow(/20 MB safe processing limit/);
   });
 
+  it("coalesces concurrent preview and debug invoice context reads", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-08-01",
+      endDate: "2026-08-31",
+    });
+    const sourcePath = path.join(baseFolder, "shared-context.png");
+    await fs.writeFile(sourcePath, "shared context receipt");
+    const imported = await new ImportManager(
+      store,
+      { getOpenAiKey: async () => null },
+      () => undefined
+    ).importFiles(invoice.id, [sourcePath]);
+    const receipt = imported.invoice.receipts[0];
+    const loadGate = deferred();
+    const loadInvoice = vi.fn(async (invoiceId: string) => {
+      await loadGate.promise;
+      return store.loadInvoice(invoiceId);
+    });
+    const getInvoiceFolder = vi.fn((invoiceId: string) => store.getInvoiceFolder(invoiceId));
+    const exporter = new InvoiceExporter({ loadInvoice, getInvoiceFolder }, () => null);
+
+    const previewRequest = exporter.getReceiptPreview(invoice.id, receipt.id);
+    const debugRequest = exporter.getReceiptDebug(invoice.id, receipt.id);
+    expect(loadInvoice).toHaveBeenCalledTimes(1);
+    loadGate.resolve();
+
+    const [preview, debug] = await Promise.all([previewRequest, debugRequest]);
+    expect(preview.bytes).toEqual(Buffer.from("shared context receipt"));
+    expect(debug).toBeNull();
+    expect(loadInvoice).toHaveBeenCalledTimes(1);
+    expect(getInvoiceFolder).toHaveBeenCalledTimes(1);
+  });
+
   it("copies spreadsheet-safe TSV from the latest invoice revision", async () => {
     const invoice = await store.createInvoice({
       startDate: "2026-08-01",
@@ -163,6 +204,86 @@ describe("InvoiceExporter receipt preview", () => {
     await expect(fs.access(path.join(outputPath, "invoice.json"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("bounds concurrent receipt copies and their destination hash checks", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-08-01",
+      endDate: "2026-08-31",
+    });
+    const sourcePaths: string[] = [];
+    for (let index = 0; index < EXPORT_FILE_CONCURRENCY * 2 + 1; index += 1) {
+      const sourcePath = path.join(baseFolder, `bounded-${index}.png`);
+      await fs.writeFile(sourcePath, `unique receipt ${index}`);
+      sourcePaths.push(sourcePath);
+    }
+    await new ImportManager(store, { getOpenAiKey: async () => null }, () => undefined).importFiles(
+      invoice.id,
+      sourcePaths
+    );
+    const exportParent = await fs.mkdtemp(path.join(os.tmpdir(), "receipt-export-bounded-"));
+    temporaryExports.push(exportParent);
+    electronMocks.showOpenDialog.mockResolvedValue({
+      canceled: false,
+      filePaths: [exportParent],
+    });
+    const actualCopyFile = fs.copyFile.bind(fs);
+    let activeCopies = 0;
+    let maximumActiveCopies = 0;
+    const copyFileSpy = vi.spyOn(fs, "copyFile").mockImplementation(async (...args) => {
+      activeCopies += 1;
+      maximumActiveCopies = Math.max(maximumActiveCopies, activeCopies);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      try {
+        await actualCopyFile(...args);
+      } finally {
+        activeCopies -= 1;
+      }
+    });
+
+    try {
+      await new InvoiceExporter(store, () => ({}) as never).exportPackage(invoice.id, {
+        includeDebug: false,
+        asZip: false,
+      });
+    } finally {
+      copyFileSpy.mockRestore();
+    }
+
+    expect(maximumActiveCopies).toBe(EXPORT_FILE_CONCURRENCY);
+  });
+
+  it("removes the staged folder when a bounded debug copy fails", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-08-01",
+      endDate: "2026-08-31",
+    });
+    const sourcePath = path.join(baseFolder, "cleanup-source.png");
+    await fs.writeFile(sourcePath, "cleanup receipt");
+    const imported = await new ImportManager(
+      store,
+      { getOpenAiKey: async () => null },
+      () => undefined
+    ).importFiles(invoice.id, [sourcePath]);
+    const receipt = imported.invoice.receipts[0];
+    const invoiceFolder = await store.getInvoiceFolder(invoice.id);
+    const debugTarget = path.join(baseFolder, "external-debug.json");
+    await fs.writeFile(debugTarget, "{}\n");
+    await fs.symlink(debugTarget, path.join(invoiceFolder, receipt.debugPath));
+    const exportParent = await fs.mkdtemp(path.join(os.tmpdir(), "receipt-export-cleanup-"));
+    temporaryExports.push(exportParent);
+    electronMocks.showOpenDialog.mockResolvedValue({
+      canceled: false,
+      filePaths: [exportParent],
+    });
+
+    await expect(
+      new InvoiceExporter(store, () => ({}) as never).exportPackage(invoice.id, {
+        includeDebug: true,
+        asZip: false,
+      })
+    ).rejects.toThrow(/symbolic link|not an ordinary file/);
+    await expect(fs.readdir(exportParent)).resolves.toEqual([]);
   });
 
   it("rejects folder and ZIP destinations inside the live invoice data", async () => {

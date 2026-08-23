@@ -9,8 +9,8 @@ import type {
   ReceiptRecord,
 } from "../shared/types";
 import type { InvoiceStore } from "./invoice-store";
+import { ReceiptDebugValidationError, readReceiptDebugFile } from "./receipt-debug";
 import { resolveInside } from "./receipt-files";
-import { readReceiptDebugFile, ReceiptDebugValidationError } from "./receipt-debug";
 
 type CheckerStore = Pick<
   InvoiceStore,
@@ -200,39 +200,40 @@ export class InvoiceChecker {
   }
 
   private checkLikelyTransactionDuplicates(invoice: InvoiceDocument, issues: PendingIssue[]): void {
-    const candidates = invoice.rows.filter(isTransactionCandidate);
-    for (let leftIndex = 0; leftIndex < candidates.length; leftIndex += 1) {
-      const left = candidates[leftIndex];
-      const leftMerchant = normalizeMerchantComment(left.comment);
-      for (let rightIndex = leftIndex + 1; rightIndex < candidates.length; rightIndex += 1) {
-        const right = candidates[rightIndex];
-        if (
-          left.date !== right.date ||
-          left.groceriesMinor !== right.groceriesMinor ||
-          leftMerchant !== normalizeMerchantComment(right.comment)
-        ) {
-          continue;
-        }
-        const rows = [left, right];
-        issues.push({
-          code: "likely-transaction-duplicate",
-          message:
-            "These rows may describe the same transaction: merchant/comment, date, and total match.",
-          rowIds: rows.map((row) => row.id),
-          receiptIds: receiptIdsForRows(rows),
-          acknowledgeable: true,
-          evidence: {
-            rows: rows
-              .map((row) => ({
-                id: row.id,
-                date: row.date,
-                groceriesMinor: row.groceriesMinor,
-                merchant: normalizeMerchantComment(row.comment),
-              }))
-              .sort(compareCanonicalObjects),
-          },
-        });
-      }
+    const groups = new Map<string, Array<{ row: InvoiceRow; merchant: string }>>();
+    for (const row of invoice.rows) {
+      if (!isIsoDate(row.date) || row.groceriesMinor === null) continue;
+      const merchant = normalizeMerchantComment(row.comment);
+      if (!merchant) continue;
+
+      const key = JSON.stringify([row.date, row.groceriesMinor, merchant]);
+      const group = groups.get(key);
+      const candidate = { row, merchant };
+      if (group) group.push(candidate);
+      else groups.set(key, [candidate]);
+    }
+
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      const rows = group.map(({ row }) => row);
+      issues.push({
+        code: "likely-transaction-duplicate",
+        message:
+          "These rows may describe the same transaction: merchant/comment, date, and total match.",
+        rowIds: rows.map((row) => row.id),
+        receiptIds: receiptIdsForRows(rows),
+        acknowledgeable: true,
+        evidence: {
+          rows: group
+            .map(({ row, merchant }) => ({
+              id: row.id,
+              date: row.date,
+              groceriesMinor: row.groceriesMinor,
+              merchant,
+            }))
+            .sort(compareCanonicalObjects),
+        },
+      });
     }
   }
 
@@ -425,16 +426,6 @@ function compareCanonicalObjects(left: object, right: object): number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isTransactionCandidate(
-  row: InvoiceRow
-): row is InvoiceRow & { date: string; groceriesMinor: number } {
-  return (
-    isIsoDate(row.date) &&
-    row.groceriesMinor !== null &&
-    normalizeMerchantComment(row.comment).length > 0
-  );
 }
 
 function isIsoDate(value: string | null): value is string {

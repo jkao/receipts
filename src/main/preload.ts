@@ -1,20 +1,37 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
+import { isIpcWireResult, ReceiptInvoiceError } from "../shared/app-error";
 import { IPC } from "../shared/ipc";
-import type {
-  DesktopApi,
-  ExportPackageOptions,
-  ImportFilesOptions,
-  ImportProgress,
-  InvoicePeriod,
-  InvoiceRow,
-  ReceiptPreview,
-  ReceiptPreviewPayload,
-  RemoveInvoiceOptions,
-} from "../shared/types";
+import type { IpcArgs, IpcRequestChannel, IpcResult } from "../shared/ipc-contract";
+import type { DesktopApi, ImportProgress, ReceiptPreview } from "../shared/types";
 
 const authorizedImportPaths = new Set<string>();
 let activePreviewUrl: string | null = null;
 let previewRequestSequence = 0;
+
+async function invoke<Channel extends IpcRequestChannel>(
+  channel: Channel,
+  ...args: IpcArgs<Channel>
+): Promise<IpcResult<Channel>> {
+  const result: unknown = await ipcRenderer.invoke(channel, ...args);
+  // Accept a raw value for compatibility with older packaged main processes;
+  // current handlers always return the structured envelope.
+  if (!isIpcWireResult(result)) return result as IpcResult<Channel>;
+  if (!result.ok) throw new ReceiptInvoiceError(result.error.code, result.error.message);
+  return result.value as IpcResult<Channel>;
+}
+
+function revokeActivePreviewUrl(): void {
+  if (!activePreviewUrl) return;
+  URL.revokeObjectURL(activePreviewUrl);
+  activePreviewUrl = null;
+}
+
+function releaseReceiptPreview(): void {
+  // Invalidate an in-flight request as well as releasing an already-created
+  // URL. A late IPC response must not recreate a Blob after its drawer closed.
+  previewRequestSequence += 1;
+  revokeActivePreviewUrl();
+}
 
 function authorizeImportPath(filePath: string): string {
   if (filePath) {
@@ -38,7 +55,7 @@ function assertAuthorizedImportPaths(paths: string[]): void {
 }
 
 async function chooseReceiptFiles(): Promise<string[]> {
-  const result: unknown = await ipcRenderer.invoke(IPC.receiptsChoose);
+  const result: unknown = await invoke(IPC.receiptsChoose);
   if (!Array.isArray(result) || result.some((item) => typeof item !== "string")) {
     throw new Error("The receipt picker returned an invalid selection.");
   }
@@ -47,16 +64,9 @@ async function chooseReceiptFiles(): Promise<string[]> {
 
 async function getReceiptPreview(invoiceId: string, receiptId: string): Promise<ReceiptPreview> {
   const requestSequence = ++previewRequestSequence;
-  if (activePreviewUrl) {
-    URL.revokeObjectURL(activePreviewUrl);
-    activePreviewUrl = null;
-  }
+  revokeActivePreviewUrl();
 
-  const payload = (await ipcRenderer.invoke(
-    IPC.receiptPreview,
-    invoiceId,
-    receiptId
-  )) as ReceiptPreviewPayload;
+  const payload = await invoke(IPC.receiptPreview, invoiceId, receiptId);
   if (requestSequence !== previewRequestSequence) {
     throw new Error("A newer receipt preview was requested.");
   }
@@ -64,9 +74,14 @@ async function getReceiptPreview(invoiceId: string, receiptId: string): Promise<
     throw new Error("The receipt preview returned invalid binary data.");
   }
 
-  const bytes = new Uint8Array(payload.bytes.byteLength);
-  bytes.set(payload.bytes);
-  const previewUrl = URL.createObjectURL(new Blob([bytes.buffer], { type: payload.mimeType }));
+  const sourceBuffer = payload.bytes.buffer;
+  const blobBuffer =
+    sourceBuffer instanceof ArrayBuffer &&
+    payload.bytes.byteOffset === 0 &&
+    payload.bytes.byteLength === sourceBuffer.byteLength
+      ? sourceBuffer
+      : Uint8Array.from(payload.bytes).buffer;
+  const previewUrl = URL.createObjectURL(new Blob([blobBuffer], { type: payload.mimeType }));
   activePreviewUrl = previewUrl;
   return {
     filename: payload.filename,
@@ -77,58 +92,50 @@ async function getReceiptPreview(invoiceId: string, receiptId: string): Promise<
 }
 
 const api: DesktopApi = {
-  getSettings: () => ipcRenderer.invoke(IPC.settingsGet),
-  chooseBaseFolder: () => ipcRenderer.invoke(IPC.settingsChooseBase),
-  updateDefaultRate: (rateMinor) => ipcRenderer.invoke(IPC.settingsUpdateRate, rateMinor),
-  saveOpenAiKey: (apiKey) => ipcRenderer.invoke(IPC.settingsSaveKey, apiKey),
-  deleteOpenAiKey: () => ipcRenderer.invoke(IPC.settingsDeleteKey),
-  testOpenAiKey: (apiKey) => ipcRenderer.invoke(IPC.settingsTestKey, apiKey),
-  listInvoices: () => ipcRenderer.invoke(IPC.invoicesList),
-  createInvoice: (period: InvoicePeriod) => ipcRenderer.invoke(IPC.invoicesCreate, period),
-  loadInvoice: (invoiceId: string) => ipcRenderer.invoke(IPC.invoicesLoad, invoiceId),
-  removeInvoice: (invoiceId: string, options: RemoveInvoiceOptions) =>
-    ipcRenderer.invoke(IPC.invoicesRemove, invoiceId, options),
-  checkInvoice: (invoiceId: string) => ipcRenderer.invoke(IPC.invoicesCheck, invoiceId),
-  setReviewAcknowledgement: (
-    invoiceId: string,
-    fingerprint: string,
-    acknowledged: boolean,
-    expectedRevision: number
-  ) =>
-    ipcRenderer.invoke(
+  getSettings: () => invoke(IPC.settingsGet),
+  chooseBaseFolder: () => invoke(IPC.settingsChooseBase),
+  updateDefaultRate: (rateMinor) => invoke(IPC.settingsUpdateRate, rateMinor),
+  saveOpenAiKey: (apiKey) => invoke(IPC.settingsSaveKey, apiKey),
+  deleteOpenAiKey: () => invoke(IPC.settingsDeleteKey),
+  testOpenAiKey: (apiKey) => invoke(IPC.settingsTestKey, apiKey),
+  listInvoices: () => invoke(IPC.invoicesList),
+  createInvoice: (period) => invoke(IPC.invoicesCreate, period),
+  loadInvoice: (invoiceId) => invoke(IPC.invoicesLoad, invoiceId),
+  removeInvoice: (invoiceId, options) => invoke(IPC.invoicesRemove, invoiceId, options),
+  checkInvoice: (invoiceId) => invoke(IPC.invoicesCheck, invoiceId),
+  setReviewAcknowledgement: (invoiceId, fingerprint, acknowledged, expectedRevision) =>
+    invoke(
       IPC.invoicesSetReviewAcknowledgement,
       invoiceId,
       fingerprint,
       acknowledged,
       expectedRevision
     ),
-  saveRows: (invoiceId: string, rows: InvoiceRow[], expectedRevision: number) =>
-    ipcRenderer.invoke(IPC.invoicesSaveRows, invoiceId, rows, expectedRevision),
+  saveRows: (invoiceId, rows, expectedRevision) =>
+    invoke(IPC.invoicesSaveRows, invoiceId, rows, expectedRevision),
   chooseReceiptFiles,
   pathForFile: (file: File) => authorizeImportPath(webUtils.getPathForFile(file)),
-  importFiles: async (invoiceId: string, paths: string[], options?: ImportFilesOptions) => {
+  importFiles: async (invoiceId, paths, options) => {
     assertAuthorizedImportPaths(paths);
-    return ipcRenderer.invoke(IPC.receiptsImport, invoiceId, paths, options);
+    return invoke(IPC.receiptsImport, invoiceId, paths, options);
   },
-  retryReceipts: (invoiceId: string, receiptIds: string[]) =>
-    ipcRenderer.invoke(IPC.receiptsRetry, invoiceId, receiptIds),
-  deleteRows: (invoiceId: string, rowIds: string[]) =>
-    ipcRenderer.invoke(IPC.rowsDelete, invoiceId, rowIds),
-  undoLastDelete: (invoiceId: string) => ipcRenderer.invoke(IPC.rowsUndoDelete, invoiceId),
+  startImport: async (invoiceId, paths, options) => {
+    assertAuthorizedImportPaths(paths);
+    return invoke(IPC.receiptsImportStart, invoiceId, paths, options);
+  },
+  cancelImport: (jobId) => invoke(IPC.receiptsImportCancel, jobId),
+  retryReceipts: (invoiceId, receiptIds) => invoke(IPC.receiptsRetry, invoiceId, receiptIds),
+  deleteRows: (invoiceId, rowIds) => invoke(IPC.rowsDelete, invoiceId, rowIds),
+  undoLastDelete: (invoiceId) => invoke(IPC.rowsUndoDelete, invoiceId),
   getReceiptPreview,
-  getReceiptDebug: (invoiceId: string, receiptId: string) =>
-    ipcRenderer.invoke(IPC.receiptDebug, invoiceId, receiptId),
-  copyTsv: (
-    invoiceId: string,
-    rowIds: string[] | null,
-    includeHeaders: boolean,
-    includeTotals: boolean
-  ) => ipcRenderer.invoke(IPC.invoiceCopyTsv, invoiceId, rowIds, includeHeaders, includeTotals),
-  revealInvoice: (invoiceId: string) => ipcRenderer.invoke(IPC.invoiceReveal, invoiceId),
-  buildInvoiceOutput: (invoiceId: string) => ipcRenderer.invoke(IPC.invoiceBuildOutput, invoiceId),
-  revealOutput: (invoiceId: string) => ipcRenderer.invoke(IPC.invoiceRevealOutput, invoiceId),
-  exportPackage: (invoiceId: string, options: ExportPackageOptions) =>
-    ipcRenderer.invoke(IPC.invoiceExport, invoiceId, options),
+  releaseReceiptPreview,
+  getReceiptDebug: (invoiceId, receiptId) => invoke(IPC.receiptDebug, invoiceId, receiptId),
+  copyTsv: (invoiceId, rowIds, includeHeaders, includeTotals) =>
+    invoke(IPC.invoiceCopyTsv, invoiceId, rowIds, includeHeaders, includeTotals),
+  revealInvoice: (invoiceId) => invoke(IPC.invoiceReveal, invoiceId),
+  buildInvoiceOutput: (invoiceId) => invoke(IPC.invoiceBuildOutput, invoiceId),
+  revealOutput: (invoiceId) => invoke(IPC.invoiceRevealOutput, invoiceId),
+  exportPackage: (invoiceId, options) => invoke(IPC.invoiceExport, invoiceId, options),
   onImportProgress: (callback: (progress: ImportProgress) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, progress: ImportProgress) =>
       callback(progress);

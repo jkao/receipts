@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ReceiptInvoiceError } from "../../shared/app-error";
 import type { InvoiceDocument, InvoiceRow } from "../../shared/types";
 
 const reactEffects = vi.hoisted(() => ({ cleanups: [] as Array<() => void> }));
@@ -108,20 +109,53 @@ describe("useInvoiceAutosave", () => {
     expect(saveRows).toHaveBeenCalledTimes(2);
   });
 
+  it("defers the full row clone until a staged edit is actually persisted", async () => {
+    const clone = vi.fn(<Value>(value: Value) => value);
+    const saveRows = vi.fn().mockResolvedValue(invoice("invoice-a", 2, [row("a")]));
+    vi.stubGlobal("structuredClone", clone);
+    vi.stubGlobal("window", { receiptApp: { saveRows } });
+    const autosave = useInvoiceAutosave({ onSaved: vi.fn(), onError: vi.fn() });
+
+    autosave.reset(invoice("invoice-a", 1, []));
+    clone.mockClear();
+    autosave.stage([row("a")]);
+    expect(clone).not.toHaveBeenCalled();
+
+    await autosave.flush();
+    expect(clone).toHaveBeenCalledOnce();
+  });
+
+  it("does not save an edit that returns to the durable row snapshot", async () => {
+    const saveRows = vi.fn();
+    vi.stubGlobal("window", { receiptApp: { saveRows } });
+    const autosave = useInvoiceAutosave({ onSaved: vi.fn(), onError: vi.fn() });
+    const savedRows = [row("saved")];
+
+    autosave.reset(invoice("invoice-a", 1, savedRows));
+    autosave.stage([{ ...savedRows[0], comment: "Temporary edit" }]);
+    autosave.stage([{ ...savedRows[0] }]);
+
+    await expect(autosave.flush()).resolves.toBeNull();
+    expect(saveRows).not.toHaveBeenCalled();
+  });
+
   it("keeps a revision conflict blocking flushes until the invoice is reset", async () => {
-    const conflict = "Invoice changed: expected revision 1, found 2.";
-    const saveRows = vi.fn().mockRejectedValue(new Error(conflict));
+    const conflict = new ReceiptInvoiceError(
+      "REVISION_CONFLICT",
+      "Invoice changed: expected revision 1, found 2."
+    );
+    const saveRows = vi.fn().mockRejectedValue(conflict);
     vi.stubGlobal("window", { receiptApp: { saveRows } });
     const autosave = useInvoiceAutosave({ onSaved: vi.fn(), onError: vi.fn() });
 
     autosave.reset(invoice("invoice-a", 1, []));
     autosave.stage([row("a")]);
-    await expect(autosave.flush()).rejects.toThrow(conflict);
+    await expect(autosave.flush()).rejects.toThrow(conflict.message);
 
     // Reverting to the revision-one row snapshot must not claim that the
     // revision-one document is current when revision two exists on disk.
     autosave.stage([]);
-    await expect(autosave.flush()).rejects.toThrow(conflict);
+    await expect(autosave.flush()).rejects.toThrow(conflict.message);
     expect(saveRows).toHaveBeenCalledOnce();
 
     autosave.reset(invoice("invoice-a", 2, []));

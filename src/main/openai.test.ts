@@ -259,6 +259,21 @@ describe("OpenAiReceiptClient", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("combines caller cancellation with the extraction timeout", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetchMock = vi.fn<FetchLike>(async (_input, init) => {
+      expect(init?.signal?.aborted).toBe(true);
+      throw new DOMException("The operation was aborted", "AbortError");
+    });
+    const client = new OpenAiReceiptClient("fake-cancel-key", fetchMock as FetchLike);
+
+    await expect(
+      client.extract(Buffer.from("image"), "receipt.png", "image/png", controller.signal)
+    ).rejects.toThrow(/Could not reach OpenAI/);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("rejects malformed structured output instead of silently coercing it", async () => {
     const fetchMock = vi.fn<FetchLike>(async () =>
       jsonResponse({

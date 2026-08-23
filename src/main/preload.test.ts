@@ -42,12 +42,64 @@ describe("receipt preload bridge", () => {
     });
   });
 
+  it("exposes authorized background import start and cancellation calls", async () => {
+    const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
+    const path = "/receipts/background.jpg";
+    electron.getPathForFile.mockReturnValue(path);
+    const authorizedPath = api.pathForFile({ name: "background.jpg" } as File);
+    const started = { jobId: "import-1", importedCount: 1 };
+    const cancelled = { jobId: "import-1", cancelled: true };
+    electron.invoke.mockReset().mockResolvedValueOnce(started).mockResolvedValueOnce(cancelled);
+
+    await expect(
+      api.startImport("invoice-1", [authorizedPath], { method: "drag-drop" })
+    ).resolves.toBe(started);
+    expect(electron.invoke).toHaveBeenNthCalledWith(
+      1,
+      IPC.receiptsImportStart,
+      "invoice-1",
+      [path],
+      { method: "drag-drop" }
+    );
+    await expect(api.cancelImport("import-1")).resolves.toBe(cancelled);
+    expect(electron.invoke).toHaveBeenNthCalledWith(2, IPC.receiptsImportCancel, "import-1");
+  });
+
+  it("forwards job-correlated terminal import progress and removes its listener", () => {
+    const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
+    const callback = vi.fn();
+    electron.on.mockClear();
+    electron.removeListener.mockClear();
+
+    const unsubscribe = api.onImportProgress(callback);
+    const listener = electron.on.mock.calls[0]?.[1];
+    const progress = {
+      jobId: "import-1",
+      invoiceId: "invoice-1",
+      current: 2,
+      total: 2,
+      filename: "Receipt import",
+      status: "complete" as const,
+    };
+    listener({}, progress);
+
+    expect(electron.on).toHaveBeenCalledWith(IPC.importProgress, listener);
+    expect(callback).toHaveBeenCalledWith(progress);
+    unsubscribe();
+    expect(electron.removeListener).toHaveBeenCalledWith(IPC.importProgress, listener);
+  });
+
   it("rejects renderer-supplied paths that were not chosen or dropped", async () => {
     const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
     electron.invoke.mockClear();
 
     await expect(
       api.importFiles("invoice-1", ["/Users/example/private.pdf"], {
+        method: "drag-drop",
+      })
+    ).rejects.toThrow("Choose or drop receipt files");
+    await expect(
+      api.startImport("invoice-1", ["/Users/example/private.pdf"], {
         method: "drag-drop",
       })
     ).rejects.toThrow("Choose or drop receipt files");
@@ -113,6 +165,39 @@ describe("receipt preload bridge", () => {
 
     expect(createObjectUrl).toHaveBeenCalledTimes(2);
     expect(revokeObjectUrl).toHaveBeenCalledWith("blob:preview-one");
+    api.releaseReceiptPreview();
+    expect(revokeObjectUrl).toHaveBeenNthCalledWith(2, "blob:preview-two");
+    createObjectUrl.mockRestore();
+    revokeObjectUrl.mockRestore();
+  });
+
+  it("invalidates a pending preview when the renderer releases it", async () => {
+    const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
+    let resolvePreview!: (value: {
+      filename: string;
+      mimeType: string;
+      bytes: Uint8Array;
+      managedPath: string;
+    }) => void;
+    const pendingPreview = new Promise<Parameters<typeof resolvePreview>[0]>((resolve) => {
+      resolvePreview = resolve;
+    });
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL");
+    const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    electron.invoke.mockReset().mockReturnValueOnce(pendingPreview);
+
+    const request = api.getReceiptPreview("invoice-1", "receipt-late");
+    api.releaseReceiptPreview();
+    resolvePreview({
+      filename: "late.png",
+      mimeType: "image/png",
+      bytes: new Uint8Array([1, 2, 3]),
+      managedPath: "/managed/late.png",
+    });
+
+    await expect(request).rejects.toThrow("A newer receipt preview was requested");
+    expect(createObjectUrl).not.toHaveBeenCalled();
+    expect(revokeObjectUrl).not.toHaveBeenCalled();
     createObjectUrl.mockRestore();
     revokeObjectUrl.mockRestore();
   });
@@ -129,6 +214,24 @@ describe("receipt preload bridge", () => {
 
     await expect(api.checkInvoice("invoice-1")).resolves.toBe(result);
     expect(electron.invoke).toHaveBeenCalledWith(IPC.invoicesCheck, "invoice-1");
+  });
+
+  it("reconstructs structured main-process failures with a stable error code", async () => {
+    const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
+    electron.invoke.mockResolvedValue({
+      ok: false,
+      error: {
+        code: "REVISION_CONFLICT",
+        message: "Invoice changed on disk.",
+      },
+    });
+
+    const request = api.loadInvoice("invoice-1");
+    await expect(request).rejects.toMatchObject({
+      name: "ReceiptInvoiceError",
+      code: "REVISION_CONFLICT",
+    });
+    await expect(request).rejects.toThrow("Invoice changed on disk.");
   });
 
   it("exposes revision-checked soft and hard invoice removal", async () => {

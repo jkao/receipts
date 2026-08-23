@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { appErrorCode } from "../../shared/app-error";
 import type { InvoiceDocument, InvoiceRow } from "../../shared/types";
 
 export type SaveStatus = "saved" | "dirty" | "saving" | "error";
@@ -12,7 +13,9 @@ interface WorkingInvoice {
   invoiceId: string | null;
   revision: number;
   rows: InvoiceRow[];
-  savedRows: string;
+  changeVersion: number;
+  savedVersion: number;
+  savedSignature: string;
 }
 
 function rowsSignature(rows: readonly InvoiceRow[]): string {
@@ -20,7 +23,7 @@ function rowsSignature(rows: readonly InvoiceRow[]): string {
 }
 
 function isRevisionConflict(message: string | null): boolean {
-  return /changed: expected revision \d+, found \d+/i.test(message ?? "");
+  return appErrorCode(message) === "REVISION_CONFLICT";
 }
 
 export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
@@ -31,7 +34,9 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
     invoiceId: null,
     revision: 0,
     rows: [],
-    savedRows: "[]",
+    changeVersion: 0,
+    savedVersion: 0,
+    savedSignature: "[]",
   });
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightRef = useRef<Promise<InvoiceDocument | null> | null>(null);
@@ -72,7 +77,7 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
         if (inFlightGeneration === generationRef.current) throw error;
       }
       const working = workingRef.current;
-      if (rowsSignature(working.rows) === working.savedRows) return null;
+      if (working.changeVersion === working.savedVersion) return null;
       return persist();
     }
 
@@ -84,7 +89,14 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
     }
 
     const working = workingRef.current;
-    if (!working.invoiceId || rowsSignature(working.rows) === working.savedRows) {
+    if (!working.invoiceId || working.changeVersion === working.savedVersion) {
+      if (mountedRef.current) setStatus("saved");
+      return null;
+    }
+
+    const currentSignature = rowsSignature(working.rows);
+    if (currentSignature === working.savedSignature) {
+      working.savedVersion = working.changeVersion;
       if (mountedRef.current) setStatus("saved");
       return null;
     }
@@ -92,6 +104,7 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
     const generation = generationRef.current;
     const invoiceId = working.invoiceId;
     const revision = working.revision;
+    const changeVersion = working.changeVersion;
     const rows = structuredClone(working.rows);
     if (mountedRef.current) {
       setStatus("saving");
@@ -108,10 +121,11 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
       savedDocument = await task;
       if (generation === generationRef.current && invoiceId === workingRef.current.invoiceId) {
         workingRef.current.revision = savedDocument.revision;
-        workingRef.current.savedRows = rowsSignature(savedDocument.rows);
+        workingRef.current.savedVersion = changeVersion;
+        workingRef.current.savedSignature = rowsSignature(savedDocument.rows);
         if (mountedRef.current) {
           const hasQueuedRows =
-            rowsSignature(workingRef.current.rows) !== workingRef.current.savedRows;
+            workingRef.current.changeVersion !== workingRef.current.savedVersion;
           setStatus(hasQueuedRows ? "dirty" : "saved");
           onSavedRef.current(savedDocument);
         }
@@ -132,7 +146,7 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
       }
       if (
         generation === generationRef.current &&
-        rowsSignature(workingRef.current.rows) !== workingRef.current.savedRows &&
+        workingRef.current.changeVersion !== workingRef.current.savedVersion &&
         mountedRef.current
       ) {
         setStatus((current) => (current === "error" ? current : "dirty"));
@@ -145,7 +159,7 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
     if (
       generation === generationRef.current &&
       invoiceId === workingRef.current.invoiceId &&
-      rowsSignature(workingRef.current.rows) !== workingRef.current.savedRows
+      workingRef.current.changeVersion !== workingRef.current.savedVersion
     ) {
       return persist();
     }
@@ -163,9 +177,18 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
           invoiceId: invoice.id,
           revision: invoice.revision,
           rows: structuredClone(invoice.rows),
-          savedRows: rowsSignature(invoice.rows),
+          changeVersion: 0,
+          savedVersion: 0,
+          savedSignature: rowsSignature(invoice.rows),
         }
-      : { invoiceId: null, revision: 0, rows: [], savedRows: "[]" };
+      : {
+          invoiceId: null,
+          revision: 0,
+          rows: [],
+          changeVersion: 0,
+          savedVersion: 0,
+          savedSignature: "[]",
+        };
     setStatus("saved");
     setSaveError(null);
     saveErrorRef.current = null;
@@ -173,7 +196,10 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
 
   const stage = useCallback(
     (rows: InvoiceRow[]) => {
-      workingRef.current.rows = structuredClone(rows);
+      // Renderer rows are immutable snapshots. Keep the reference on the hot
+      // input path and clone once, when the debounce actually persists it.
+      workingRef.current.rows = rows;
+      workingRef.current.changeVersion += 1;
       if (isRevisionConflict(saveErrorRef.current)) {
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
         timeoutRef.current = null;
@@ -182,13 +208,6 @@ export function useInvoiceAutosave({ onSaved, onError }: AutosaveOptions) {
       }
       saveErrorRef.current = null;
       setSaveError(null);
-      if (rowsSignature(rows) === workingRef.current.savedRows) {
-        setStatus("saved");
-        if (timeoutRef.current) clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-        return;
-      }
-
       setStatus("dirty");
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
       timeoutRef.current = setTimeout(() => {

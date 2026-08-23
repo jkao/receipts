@@ -1,14 +1,14 @@
 import {
   type DragEvent,
-  type ReactNode,
+  type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
 } from "react";
 import type { SortColumn } from "react-data-grid";
+import { appErrorCode } from "../shared/app-error";
 import type {
   ImportFilesOptions,
   ImportProgress,
@@ -16,16 +16,36 @@ import type {
   InvoiceDocument,
   InvoiceOutputResult,
   InvoicePeriod,
-  InvoiceRemovalResult,
   InvoiceRow,
   InvoiceSummary,
   SettingsView,
 } from "../shared/types";
+import { CopyInvoiceActions } from "./components/CopyInvoiceActions";
+import { ImportProgressPanel } from "./components/ImportProgressPanel";
 import { InvoiceCheckSummary } from "./components/InvoiceCheckSummary";
 import { InvoiceGrid } from "./components/InvoiceGrid";
+import {
+  ExportModal,
+  invoiceRemovalNotification,
+  NewInvoiceModal,
+  RemoveInvoiceModal,
+  SettingsModal,
+} from "./components/InvoiceModals";
+import { Onboarding } from "./components/Onboarding";
 import { OutputReadyBanner } from "./components/OutputReadyBanner";
+import { receiptUploadConfirmationMessage } from "./components/ReceiptUploadDisclosure";
 import { ReceiptDrawer } from "./components/ReceiptDrawer";
+import { SaveIndicator } from "./components/SaveIndicator";
+import { Sidebar } from "./components/Sidebar";
+import {
+  ToastRegion,
+  type ToastAction,
+  type ToastMessage,
+  type ToastTone,
+} from "./components/ToastRegion";
 import { type SaveStatus, useInvoiceAutosave } from "./hooks/useInvoiceAutosave";
+import { useImportJobs } from "./hooks/useImportJobs";
+import { useMediaQuery } from "./hooks/useMediaQuery";
 import {
   calculateTotals,
   formatMoney,
@@ -33,37 +53,41 @@ import {
   invoiceToSummary,
   messageFromError,
   newRowId,
-  parseMoneyInput,
   todayIso,
 } from "./lib/format";
+import { commitActiveGridEditor } from "./lib/activeGridEditor";
 import {
   hasInvoiceCheckAttention,
   indexInvoiceCheckIssuesByRow,
   isReviewIssue,
 } from "./lib/invoiceCheck";
 import {
+  clearImportRefresh,
+  retainImportRefreshForInvoice,
+  shouldQueueImportRefresh,
+} from "./lib/importRefreshState";
+import { scheduleIdleTask } from "./lib/scheduleIdleTask";
+import {
   DEFAULT_INVOICE_SORT,
   normalizeInvoiceSort,
   rowsHaveSameOrder,
+  rowsNeedResort,
   sortInvoiceRows,
 } from "./lib/invoiceSort";
+import { startReceiptImportWorkflow } from "./lib/receiptImportWorkflow";
 
-type ToastTone = "success" | "error" | "neutral";
-
-interface ToastAction {
-  label: string;
-  run: () => void;
-}
-
-interface ToastMessage {
-  id: string;
-  message: string;
-  tone: ToastTone;
-  action?: ToastAction;
-}
+export {
+  ExportModal,
+  invoiceRemovalNotification,
+  RemoveInvoiceModal,
+  removeInvoiceButtonLabel,
+  SettingsModal,
+} from "./components/InvoiceModals";
+export { Onboarding } from "./components/Onboarding";
 
 interface InvoiceAdoptionOptions {
   checkResult?: InvoiceCheckResult;
+  persistSort?: boolean;
   preserveBuiltOutput?: boolean;
   preserveSelection?: boolean;
 }
@@ -73,770 +97,21 @@ interface InvoiceCheckRefreshOptions {
   reportErrors?: boolean;
 }
 
-interface ModalFrameProps {
-  title: string;
-  eyebrow?: string;
-  children: ReactNode;
-  closeDisabled?: boolean;
-  descriptionId?: string;
-  onClose: () => void;
-  role?: "alertdialog" | "dialog";
-  wide?: boolean;
-}
-
-function ModalFrame({
-  title,
-  eyebrow,
-  children,
-  closeDisabled = false,
-  descriptionId,
-  onClose,
-  role = "dialog",
-  wide = false,
-}: ModalFrameProps) {
-  const titleId = useId();
-  const dialogRef = useRef<HTMLElement>(null);
-  const closeRef = useRef<HTMLButtonElement>(null);
-  const onCloseRef = useRef(onClose);
-  const closeDisabledRef = useRef(closeDisabled);
-
-  useEffect(() => {
-    onCloseRef.current = onClose;
-    closeDisabledRef.current = closeDisabled;
-  }, [closeDisabled, onClose]);
-
-  useEffect(() => {
-    const previouslyFocused =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const dialog = dialogRef.current;
-    const focusableSelector =
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
-    const focusableElements = () =>
-      dialog
-        ? Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector)).filter(
-            (element) => !element.hasAttribute("disabled") && element.getClientRects().length > 0
-          )
-        : [];
-    const preferred = dialog?.querySelector<HTMLElement>("[data-autofocus]");
-    (preferred ?? focusableElements()[0] ?? closeRef.current)?.focus();
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        if (!closeDisabledRef.current) onCloseRef.current();
-        return;
-      }
-      if (event.key !== "Tab") return;
-
-      const elements = focusableElements();
-      if (elements.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = elements[0];
-      const last = elements[elements.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      previouslyFocused?.focus();
-    };
-  }, []);
-
-  return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: The backdrop offers pointer dismissal in addition to the dialog's keyboard and button controls.
-    <div
-      className="modal-backdrop"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (!closeDisabled && event.currentTarget === event.target) onClose();
-      }}
-    >
-      {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: Both permitted roles support aria-modal; the shared frame selects one at runtime. */}
-      <section
-        ref={dialogRef}
-        aria-describedby={descriptionId}
-        aria-labelledby={titleId}
-        aria-modal="true"
-        className={`modal-card${wide ? " modal-card--wide" : ""}`}
-        role={role}
-      >
-        <header className="modal-header">
-          <div>
-            {eyebrow ? <p className="eyebrow">{eyebrow}</p> : null}
-            <h2 id={titleId}>{title}</h2>
-          </div>
-          <button
-            ref={closeRef}
-            aria-label={`Close ${title}`}
-            className="icon-button"
-            disabled={closeDisabled}
-            type="button"
-            onClick={onClose}
-          >
-            ×
-          </button>
-        </header>
-        {children}
-      </section>
-    </div>
-  );
-}
-
-interface NewInvoiceModalProps {
-  busy: boolean;
-  onClose: () => void;
-  onCreate: (period: InvoicePeriod) => Promise<void>;
-}
-
-function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProps) {
-  const today = todayIso();
-  const [startDate, setStartDate] = useState(`${today.slice(0, 8)}01`);
-  const [endDate, setEndDate] = useState(today);
-  const [error, setError] = useState<string | null>(null);
-
-  return (
-    <ModalFrame closeDisabled={busy} eyebrow="Invoice period" title="New Invoice" onClose={onClose}>
-      <form
-        className="modal-body"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!startDate || !endDate) {
-            setError("Choose both a start and end date.");
-            return;
-          }
-          if (startDate > endDate) {
-            setError("The end date must be on or after the start date.");
-            return;
-          }
-          setError(null);
-          void onCreate({ startDate, endDate });
-        }}
-      >
-        <p className="modal-intro">
-          Pick the client billing period. Receipts and manual rows will live together in this
-          invoice.
-        </p>
-        <div className="date-range-fields">
-          <label>
-            <span>Start date</span>
-            <input
-              data-autofocus
-              disabled={busy}
-              required
-              type="date"
-              value={startDate}
-              onChange={(event) => setStartDate(event.target.value)}
-            />
-          </label>
-          <span className="date-range-arrow" aria-hidden="true">
-            →
-          </span>
-          <label>
-            <span>End date</span>
-            <input
-              required
-              disabled={busy}
-              min={startDate}
-              type="date"
-              value={endDate}
-              onChange={(event) => setEndDate(event.target.value)}
-            />
-          </label>
-        </div>
-        {error ? (
-          <p className="form-error" role="alert">
-            {error}
-          </p>
-        ) : null}
-        <footer className="modal-actions">
-          <button className="button button--quiet" disabled={busy} type="button" onClick={onClose}>
-            Cancel
-          </button>
-          <button className="button button--primary" disabled={busy} type="submit">
-            {busy ? "Creating…" : "Create Invoice"}
-          </button>
-        </footer>
-      </form>
-    </ModalFrame>
-  );
-}
-
-interface SettingsModalProps {
-  settings: SettingsView;
-  onClose: () => void;
-  onSettingsChange: (settings: SettingsView) => void;
-  onChooseFolder: () => Promise<SettingsView>;
-}
-
-function SettingsModal({
-  settings,
-  onClose,
-  onSettingsChange,
-  onChooseFolder,
-}: SettingsModalProps) {
-  const [apiKey, setApiKey] = useState("");
-  const [rate, setRate] = useState((settings.defaultRateMinor / 100).toFixed(2));
-  const [busy, setBusy] = useState<string | null>(null);
-  const [message, setMessage] = useState<{ tone: ToastTone; text: string } | null>(null);
-
-  const run = async (name: string, action: () => Promise<void>) => {
-    setBusy(name);
-    setMessage(null);
-    try {
-      await action();
-    } catch (error) {
-      setMessage({ tone: "error", text: messageFromError(error) });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  return (
-    <ModalFrame
-      closeDisabled={busy != null}
-      eyebrow="Receipt Invoice"
-      title="Settings"
-      wide
-      onClose={onClose}
-    >
-      <div className="modal-body settings-body">
-        <section className="settings-section">
-          <div className="settings-section-copy">
-            <h3>Working folder</h3>
-            <p>Invoices, copied receipts, and local app data are kept together here.</p>
-          </div>
-          <div className="folder-setting">
-            <code title={settings.baseFolder ?? undefined}>
-              {settings.baseFolder ?? "No folder selected"}
-            </code>
-            <button
-              className="button button--secondary"
-              disabled={busy != null}
-              type="button"
-              onClick={() =>
-                void run("folder", async () => {
-                  const next = await onChooseFolder();
-                  onSettingsChange(next);
-                  if (next.baseFolder !== settings.baseFolder) {
-                    setMessage({ tone: "success", text: "Working folder changed." });
-                  }
-                })
-              }
-            >
-              {busy === "folder" ? "Choosing…" : "Choose…"}
-            </button>
-          </div>
-        </section>
-
-        <section className="settings-section settings-section--stacked">
-          <div className="settings-section-copy settings-section-copy--key">
-            <div>
-              <h3>OpenAI API key</h3>
-              <p>
-                Used only to scan receipts. The saved key stays encrypted on this Mac and is never
-                shown here.
-              </p>
-            </div>
-            <span className={`key-status${settings.hasOpenAiKey ? " key-status--saved" : ""}`}>
-              {settings.hasOpenAiKey ? "Key saved" : "No key"}
-            </span>
-          </div>
-          <label className="field-label">
-            <span>{settings.hasOpenAiKey ? "Replace saved key" : "API key"}</span>
-            <input
-              autoComplete="new-password"
-              disabled={busy != null}
-              placeholder="sk-…"
-              spellCheck={false}
-              type="password"
-              value={apiKey}
-              onChange={(event) => setApiKey(event.target.value)}
-            />
-          </label>
-          <div className="inline-actions">
-            <button
-              className="button button--primary"
-              disabled={!apiKey.trim() || busy != null}
-              type="button"
-              onClick={() =>
-                void run("save-key", async () => {
-                  const next = await window.receiptApp.saveOpenAiKey(apiKey.trim());
-                  setApiKey("");
-                  onSettingsChange(next);
-                  setMessage({ tone: "success", text: "API key saved securely." });
-                })
-              }
-            >
-              {busy === "save-key" ? "Saving…" : "Save Key"}
-            </button>
-            <button
-              className="button button--secondary"
-              disabled={(!apiKey.trim() && !settings.hasOpenAiKey) || busy != null}
-              type="button"
-              onClick={() =>
-                void run("test-key", async () => {
-                  const result = await window.receiptApp.testOpenAiKey(apiKey.trim() || undefined);
-                  setMessage({ tone: result.ok ? "success" : "error", text: result.message });
-                })
-              }
-            >
-              {busy === "test-key" ? "Testing…" : "Test Key"}
-            </button>
-            {settings.hasOpenAiKey ? (
-              <button
-                className="button button--danger-quiet"
-                disabled={busy != null}
-                type="button"
-                onClick={() => {
-                  if (!window.confirm("Delete the saved OpenAI API key from this Mac?")) return;
-                  void run("delete-key", async () => {
-                    const next = await window.receiptApp.deleteOpenAiKey();
-                    setApiKey("");
-                    onSettingsChange(next);
-                    setMessage({ tone: "neutral", text: "Saved API key deleted." });
-                  });
-                }}
-              >
-                {busy === "delete-key" ? "Deleting…" : "Delete Key"}
-              </button>
-            ) : null}
-          </div>
-        </section>
-
-        <section className="settings-section">
-          <div className="settings-section-copy">
-            <h3>Default hourly rate</h3>
-            <p>Used for new invoices and their labour rows.</p>
-          </div>
-          <form
-            className="rate-setting"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const minor = parseMoneyInput(rate);
-              if (minor == null || minor < 0) {
-                setMessage({ tone: "error", text: "Enter a valid hourly rate." });
-                return;
-              }
-              void run("rate", async () => {
-                const next = await window.receiptApp.updateDefaultRate(minor);
-                onSettingsChange(next);
-                setRate((next.defaultRateMinor / 100).toFixed(2));
-                setMessage({ tone: "success", text: "Default rate updated." });
-              });
-            }}
-          >
-            <label className="money-field">
-              <span aria-hidden="true">$</span>
-              <input
-                aria-label="Default hourly rate"
-                disabled={busy != null}
-                inputMode="decimal"
-                min="0"
-                step="0.01"
-                type="number"
-                value={rate}
-                onChange={(event) => setRate(event.target.value)}
-              />
-            </label>
-            <button className="button button--secondary" disabled={busy != null} type="submit">
-              {busy === "rate" ? "Saving…" : "Save"}
-            </button>
-          </form>
-        </section>
-
-        {message ? (
-          <div className={`settings-message settings-message--${message.tone}`} role="status">
-            {message.text}
-          </div>
-        ) : null}
-
-        <footer className="modal-actions">
-          <button
-            className="button button--primary"
-            disabled={busy != null}
-            type="button"
-            onClick={onClose}
-          >
-            Done
-          </button>
-        </footer>
-      </div>
-    </ModalFrame>
-  );
-}
-
-interface ExportModalProps {
-  busy: boolean;
-  onClose: () => void;
-  onExport: (asZip: boolean, includeDebug: boolean) => Promise<void>;
-}
-
-function ExportModal({ busy, onClose, onExport }: ExportModalProps) {
-  const [asZip, setAsZip] = useState(true);
-  const [includeDebug, setIncludeDebug] = useState(false);
-
-  return (
-    <ModalFrame
-      closeDisabled={busy}
-      eyebrow="Share with client"
-      title="Export Invoice"
-      onClose={onClose}
-    >
-      <form
-        className="modal-body"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void onExport(asZip, includeDebug);
-        }}
-      >
-        <p className="modal-intro">
-          Export the invoice table with its source receipts. Your working folder is not changed.
-        </p>
-        <fieldset className="choice-cards" disabled={busy}>
-          <legend>Format</legend>
-          <label className={asZip ? "choice-card choice-card--selected" : "choice-card"}>
-            <input checked={asZip} name="format" type="radio" onChange={() => setAsZip(true)} />
-            <span>
-              <strong>ZIP archive</strong>
-              <small>One file that is easy to send.</small>
-            </span>
-          </label>
-          <label className={!asZip ? "choice-card choice-card--selected" : "choice-card"}>
-            <input checked={!asZip} name="format" type="radio" onChange={() => setAsZip(false)} />
-            <span>
-              <strong>Folder</strong>
-              <small>An unpacked copy you can browse.</small>
-            </span>
-          </label>
-        </fieldset>
-        <label className="checkbox-line">
-          <input
-            checked={includeDebug}
-            disabled={busy}
-            type="checkbox"
-            onChange={(event) => setIncludeDebug(event.target.checked)}
-          />
-          <span>
-            <strong>Include scan debug files</strong>
-            <small>Usually unnecessary; useful only for troubleshooting.</small>
-          </span>
-        </label>
-        <footer className="modal-actions">
-          <button className="button button--quiet" disabled={busy} type="button" onClick={onClose}>
-            Cancel
-          </button>
-          <button className="button button--primary" disabled={busy} type="submit">
-            {busy ? "Exporting…" : `Export ${asZip ? "ZIP" : "Folder"}`}
-          </button>
-        </footer>
-      </form>
-    </ModalFrame>
-  );
-}
-
-interface RemoveInvoiceModalProps {
-  busy: boolean;
-  error: string | null;
-  invoiceName: string;
-  onClose: () => void;
-  onReload?: () => void;
-  onRemove: (hardDelete: boolean) => Promise<void>;
-}
-
-export function removeInvoiceButtonLabel(hardDelete: boolean, busy: boolean): string {
-  if (busy) return hardDelete ? "Permanently Deleting…" : "Removing…";
-  return hardDelete ? "Permanently Delete Invoice" : "Remove Invoice";
-}
-
-export function invoiceRemovalNotification(result: InvoiceRemovalResult): {
-  message: string;
-  tone: ToastTone;
-} {
-  if (result.warning) {
-    return {
-      message: `${result.invoiceName} was removed from the app, but permanent deletion was incomplete: ${result.warning}`,
-      tone: "error",
-    };
-  }
-  return {
-    message:
-      result.mode === "hard"
-        ? `Permanently deleted ${result.invoiceName} and its local files.`
-        : `Removed ${result.invoiceName}. Its local files were kept.`,
-    tone: "success",
-  };
-}
-
-export function RemoveInvoiceModal({
-  busy,
-  error,
-  invoiceName,
-  onClose,
-  onReload,
-  onRemove,
-}: RemoveInvoiceModalProps) {
-  const [hardDelete, setHardDelete] = useState(false);
-  const descriptionId = useId();
-
-  return (
-    <ModalFrame
-      closeDisabled={busy}
-      descriptionId={descriptionId}
-      eyebrow="Invoice removal"
-      role="alertdialog"
-      title="Remove Invoice?"
-      onClose={onClose}
-    >
-      <form
-        className="modal-body"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void onRemove(hardDelete);
-        }}
-      >
-        <p className="modal-intro" id={descriptionId}>
-          Remove <strong>{invoiceName}</strong> from the invoice list? By default, its folder and
-          files stay on disk and a <code>DELETED.json</code> marker hides it from the app. You can
-          restore it later by removing that marker in Finder.
-        </p>
-        <label
-          className={`checkbox-line remove-invoice-hard-delete${
-            hardDelete ? " remove-invoice-hard-delete--selected" : ""
-          }`}
-        >
-          <input
-            checked={hardDelete}
-            disabled={busy}
-            type="checkbox"
-            onChange={(event) => setHardDelete(event.target.checked)}
-          />
-          <span>
-            <strong>Permanently delete this invoice folder and every local file</strong>
-            <small>
-              The app cannot undo this. Receipts, scan details, invoice output, the .trash folder,
-              and every other file in the invoice folder will be deleted.
-            </small>
-          </span>
-        </label>
-        {error ? (
-          <div className="form-error form-error--action" role="alert">
-            <span>{error}</span>
-            {onReload ? (
-              <button className="text-button" disabled={busy} type="button" onClick={onReload}>
-                Reload Invoice…
-              </button>
-            ) : null}
-          </div>
-        ) : null}
-        <footer className="modal-actions">
-          <button
-            className="button button--quiet"
-            data-autofocus
-            disabled={busy}
-            type="button"
-            onClick={onClose}
-          >
-            Cancel
-          </button>
-          <button className="button button--danger" disabled={busy} type="submit">
-            {removeInvoiceButtonLabel(hardDelete, busy)}
-          </button>
-        </footer>
-      </form>
-    </ModalFrame>
-  );
-}
-
-interface SidebarProps {
-  invoices: InvoiceSummary[];
-  activeInvoiceId: string | null;
-  busy: boolean;
-  onNew: () => void;
-  onOpen: (invoiceId: string) => void;
-  onSettings: () => void;
-}
-
-function Sidebar({ invoices, activeInvoiceId, busy, onNew, onOpen, onSettings }: SidebarProps) {
-  return (
-    <aside className="sidebar" aria-label="Invoices">
-      <div className="brand">
-        <span className="brand-mark" aria-hidden="true">
-          R
-        </span>
-        <div>
-          <strong>Receipt Invoice</strong>
-          <span>Local workspace</span>
-        </div>
-      </div>
-      <button className="new-invoice-button" disabled={busy} type="button" onClick={onNew}>
-        <span aria-hidden="true">＋</span>
-        New Invoice
-      </button>
-      <div className="sidebar-heading">
-        <span>Invoices</span>
-        <span>{invoices.length}</span>
-      </div>
-      <nav className="invoice-list" aria-label="Saved invoices">
-        {invoices.length === 0 ? (
-          <p className="sidebar-empty">No invoices yet.</p>
-        ) : (
-          invoices.map((summary) => (
-            <button
-              aria-current={activeInvoiceId === summary.id ? "page" : undefined}
-              className={`invoice-list-item${activeInvoiceId === summary.id ? " is-active" : ""}`}
-              disabled={busy}
-              key={summary.id}
-              type="button"
-              onClick={() => onOpen(summary.id)}
-            >
-              <strong>{summary.name}</strong>
-              <span>{formatPeriod(summary.period.startDate, summary.period.endDate)}</span>
-              <small>
-                {summary.rowCount} {summary.rowCount === 1 ? "row" : "rows"} ·{" "}
-                {summary.receiptCount} {summary.receiptCount === 1 ? "receipt" : "receipts"}
-              </small>
-            </button>
-          ))
-        )}
-      </nav>
-      <button className="settings-button" disabled={busy} type="button" onClick={onSettings}>
-        <span aria-hidden="true">⚙</span>
-        Settings
-      </button>
-    </aside>
-  );
-}
-
-interface OnboardingProps {
-  busy: boolean;
-  error: string | null;
-  onChooseFolder: () => void;
-}
-
-function Onboarding({ busy, error, onChooseFolder }: OnboardingProps) {
-  return (
-    <main className="onboarding-shell">
-      <section className="onboarding-card">
-        <div className="onboarding-icon" aria-hidden="true">
-          <span>▤</span>
-        </div>
-        <p className="eyebrow">Receipt Invoice</p>
-        <h1>Turn receipts into a clean client invoice.</h1>
-        <p className="onboarding-lede">
-          Choose one local folder for your invoices and receipt copies. A Dropbox folder works too,
-          as long as the files are available on this Mac.
-        </p>
-        <div className="privacy-note">
-          <span aria-hidden="true">⌂</span>
-          <div>
-            <strong>Your folder is the database</strong>
-            <p>No account or hosted database. You can browse and back up the files yourself.</p>
-          </div>
-        </div>
-        {error ? (
-          <div className="onboarding-error" role="alert">
-            {error}
-          </div>
-        ) : null}
-        <button
-          className="button button--primary button--large"
-          disabled={busy}
-          type="button"
-          onClick={onChooseFolder}
-        >
-          {busy ? "Opening Finder…" : "Choose Working Folder"}
-        </button>
-        <small className="onboarding-footnote">You can change this later in Settings.</small>
-      </section>
-    </main>
-  );
-}
-
-function SaveIndicator({
-  status,
-  error,
-  onRetry,
-  onReload,
-}: {
-  status: SaveStatus;
-  error: string | null;
-  onRetry: () => void;
-  onReload: () => void;
-}) {
-  if (status === "error") {
-    const isRevisionConflict = /changed: expected revision \d+, found \d+/i.test(error ?? "");
-    return (
-      <span className="save-indicator save-indicator--error" title={error ?? undefined}>
-        <span role="alert">
-          <span aria-hidden="true">!</span>
-          {isRevisionConflict ? "Invoice changed on disk" : "Save failed"}
-        </span>
-        <button
-          className="save-indicator-action"
-          type="button"
-          onClick={isRevisionConflict ? onReload : onRetry}
-        >
-          {isRevisionConflict ? "Reload…" : "Retry"}
-        </button>
-      </span>
-    );
-  }
-  return (
-    <span className={`save-indicator save-indicator--${status}`} role="status">
-      <span aria-hidden="true">{status === "saved" ? "✓" : "●"}</span>
-      {status === "saving" ? "Saving…" : status === "dirty" ? "Unsaved changes" : "Saved locally"}
-    </span>
-  );
-}
-
-function ToastRegion({
-  toasts,
-  dismiss,
-}: {
-  toasts: ToastMessage[];
-  dismiss: (id: string) => void;
-}) {
-  return (
-    <div className="toast-region">
-      {toasts.map((toast) => (
-        <div className={`toast toast--${toast.tone}`} key={toast.id}>
-          <span className="toast-icon" aria-hidden="true">
-            {toast.tone === "success" ? "✓" : toast.tone === "error" ? "!" : "i"}
-          </span>
-          <span role={toast.tone === "error" ? "alert" : "status"}>{toast.message}</span>
-          {toast.action ? (
-            <button
-              className="toast-action"
-              type="button"
-              onClick={() => {
-                dismiss(toast.id);
-                toast.action?.run();
-              }}
-            >
-              {toast.action.label}
-            </button>
-          ) : null}
-          <button
-            aria-label="Dismiss message"
-            className="toast-close"
-            type="button"
-            onClick={() => dismiss(toast.id)}
-          >
-            ×
-          </button>
-        </div>
-      ))}
-    </div>
-  );
-}
+type BusyAction =
+  | "build-output"
+  | "check"
+  | "copy"
+  | "create"
+  | "delete"
+  | "export"
+  | "folder"
+  | "import"
+  | "load"
+  | "remove-invoice"
+  | "retry"
+  | "reveal-output"
+  | "review"
+  | "undo";
 
 export default function App() {
   const [settings, setSettings] = useState<SettingsView | null>(null);
@@ -851,7 +126,7 @@ export default function App() {
   const [focusRowId, setFocusRowId] = useState<string | null>(null);
   const [booting, setBooting] = useState(true);
   const [bootError, setBootError] = useState<string | null>(null);
-  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<BusyAction | null>(null);
   const [newInvoiceOpen, setNewInvoiceOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -859,6 +134,12 @@ export default function App() {
   const [removeInvoiceError, setRemoveInvoiceError] = useState<string | null>(null);
   const [removeInvoiceConflict, setRemoveInvoiceConflict] = useState(false);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
+  const [pendingImportRefreshes, setPendingImportRefreshes] = useState<ReadonlySet<string>>(
+    new Set()
+  );
+  const [receiptResourceGenerations, setReceiptResourceGenerations] = useState<
+    ReadonlyMap<string, number>
+  >(new Map());
   const [invoiceCheckResult, setInvoiceCheckResult] = useState<InvoiceCheckResult | null>(null);
   const [checkSummaryVisible, setCheckSummaryVisible] = useState(true);
   const [updatingReviewFingerprints, setUpdatingReviewFingerprints] = useState<ReadonlySet<string>>(
@@ -870,13 +151,20 @@ export default function App() {
   } | null>(null);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const drawerUsesOverlay = useMediaQuery("(max-width: 1180px)");
   const dragDepthRef = useRef(0);
+  const receiptUploadAcknowledgedRef = useRef(false);
   const allowCloseRef = useRef(false);
   const closeSaveInFlightRef = useRef(false);
   const saveStatusRef = useRef<SaveStatus>("saved");
-  const busyActionRef = useRef<string | null>(busyAction);
+  const busyActionRef = useRef<BusyAction | null>(busyAction);
   const currentInvoiceRef = useRef<InvoiceDocument | null>(null);
+  const gridPanelRef = useRef<HTMLElement | null>(null);
+  const openingInvoiceIdRef = useRef<string | null>(null);
   const sortColumnsRef = useRef<readonly SortColumn[]>(sortColumns);
+  const isInvoiceImportingRef = useRef<(invoiceId: string) => boolean>(() => false);
+  const hasActiveImportJobsRef = useRef(false);
+  const refreshingImportInvoicesRef = useRef(new Set<string>());
   const checkGenerationRef = useRef(0);
   const checkInFlightRef = useRef<{ key: string } | null>(null);
   const checkRetryAttemptsRef = useRef(new Map<string, number>());
@@ -921,6 +209,14 @@ export default function App() {
 
   const clearBuiltOutput = useCallback(() => setBuiltOutput(null), []);
 
+  const refreshReceiptResources = useCallback((invoiceId: string) => {
+    setReceiptResourceGenerations((current) => {
+      const next = new Map(current);
+      next.set(invoiceId, (next.get(invoiceId) ?? 0) + 1);
+      return next;
+    });
+  }, []);
+
   const dismissToast = useCallback((id: string) => {
     setToasts((current) => current.filter((toast) => toast.id !== id));
   }, []);
@@ -929,10 +225,16 @@ export default function App() {
     (message: string, tone: ToastTone = "neutral", action?: ToastAction) => {
       const id = newRowId();
       setToasts((current) => [...current.slice(-3), { id, message, tone, action }]);
-      window.setTimeout(() => dismissToast(id), action ? 10_000 : 5_000);
     },
-    [dismissToast]
+    []
   );
+
+  const confirmReceiptUpload = useCallback((): boolean => {
+    if (!settings?.hasOpenAiKey || receiptUploadAcknowledgedRef.current) return true;
+    const confirmed = window.confirm(receiptUploadConfirmationMessage());
+    if (confirmed) receiptUploadAcknowledgedRef.current = true;
+    return confirmed;
+  }, [settings?.hasOpenAiKey]);
 
   const mergeSummary = useCallback((document: InvoiceDocument) => {
     setInvoices((current) => {
@@ -1090,14 +392,21 @@ export default function App() {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
       if (allowCloseRef.current) return;
 
-      // Main-process file work cannot be safely interrupted. Let the current
-      // action settle, then a subsequent close can proceed normally.
-      if (busyActionRef.current) {
+      const editorCommit = commitActiveGridEditor(gridPanelRef.current);
+      if (editorCommit === "invalid") {
         event.preventDefault();
         event.returnValue = "";
         return;
       }
-      if (saveStatusRef.current === "saved") return;
+
+      // Main-process file work cannot be safely interrupted. Let the current
+      // action settle, then a subsequent close can proceed normally.
+      if (busyActionRef.current || hasActiveImportJobsRef.current) {
+        event.preventDefault();
+        event.returnValue = "";
+        return;
+      }
+      if (saveStatusRef.current === "saved" && editorCommit === "none") return;
 
       // Electron silently cancels an unload when returnValue is set. Finish
       // the queued revisioned save, then repeat the close once it is safe.
@@ -1125,8 +434,17 @@ export default function App() {
   }, [autosave.flush]);
 
   useEffect(() => {
-    if (!invoice || autosave.status !== "saved") return;
-    void refreshInvoiceCheck(invoice.id, invoice.revision);
+    if (!invoice || autosave.status !== "saved" || isInvoiceImportingRef.current(invoice.id)) {
+      return;
+    }
+    const invoiceId = invoice.id;
+    const revision = invoice.revision;
+    return scheduleIdleTask(
+      () => {
+        void refreshInvoiceCheck(invoiceId, revision);
+      },
+      { delayMs: 250, timeoutMs: 1_000 }
+    );
   }, [autosave.status, invoice, refreshInvoiceCheck]);
 
   const adoptInvoice = useCallback(
@@ -1152,6 +470,7 @@ export default function App() {
       }
       if (!options.preserveBuiltOutput) clearBuiltOutput();
       currentInvoiceRef.current = viewDocument;
+      setPendingImportRefreshes((current) => retainImportRefreshForInvoice(current, document.id));
       setInvoice(viewDocument);
       setRows(orderedRows);
       const orderedRowIds = new Set(orderedRows.map((row) => row.id));
@@ -1165,7 +484,9 @@ export default function App() {
         current && document.rows.some((row) => row.id === current) ? current : null
       );
       autosave.reset(document);
-      if (!rowsHaveSameOrder(document.rows, orderedRows)) autosave.stage(orderedRows);
+      if (options.persistSort !== false && !rowsHaveSameOrder(document.rows, orderedRows)) {
+        autosave.stage(orderedRows);
+      }
       mergeSummary(viewDocument);
     },
     [autosave.reset, autosave.stage, clearBuiltOutput, clearInvoiceCheck, mergeSummary]
@@ -1202,14 +523,124 @@ export default function App() {
     };
   }, [adoptInvoice]);
 
-  useEffect(() => {
-    if (!window.receiptApp) return;
-    return window.receiptApp.onImportProgress((progress) => {
-      if (progress.invoiceId === currentInvoiceRef.current?.id) setImportProgress(progress);
-    });
+  const handleLegacyImportProgress = useCallback((progress: ImportProgress) => {
+    if (progress.invoiceId === currentInvoiceRef.current?.id) setImportProgress(progress);
   }, []);
 
+  const handleBackgroundImportTerminal = useCallback(
+    (progress: ImportProgress) => {
+      if (
+        shouldQueueImportRefresh(
+          currentInvoiceRef.current?.id ?? null,
+          openingInvoiceIdRef.current,
+          progress.invoiceId
+        )
+      ) {
+        setPendingImportRefreshes((current) => new Set(current).add(progress.invoiceId));
+      }
+      pushToast(
+        progress.message ??
+          (progress.status === "cancelled" ? "Receipt scan cancelled." : "Receipt scan complete."),
+        progress.status === "failed" ? "error" : "neutral"
+      );
+    },
+    [pushToast]
+  );
+
+  const importJobs = useImportJobs({
+    onLegacyProgress: handleLegacyImportProgress,
+    onTerminal: handleBackgroundImportTerminal,
+  });
+  isInvoiceImportingRef.current = (invoiceId) =>
+    importJobs.isInvoiceImporting(invoiceId) || pendingImportRefreshes.has(invoiceId);
+  hasActiveImportJobsRef.current = importJobs.jobs.size > 0 || pendingImportRefreshes.size > 0;
+
+  const currentImportJob = useMemo(() => {
+    if (!invoice) return null;
+    const candidates = [...importJobs.jobs.values()].filter(
+      (progress) => progress.invoiceId === invoice.id
+    );
+    return candidates.find((progress) => progress.status !== "queued") ?? candidates[0] ?? null;
+  }, [importJobs.jobs, invoice]);
+  const importingInvoiceIds = useMemo(
+    () => new Set([...importJobs.jobs.values()].map((progress) => progress.invoiceId)),
+    [importJobs.jobs]
+  );
+  const pendingImportProgress: ImportProgress | null =
+    invoice && pendingImportRefreshes.has(invoice.id)
+      ? {
+          invoiceId: invoice.id,
+          current: 1,
+          total: 1,
+          filename: "Updating invoice rows",
+          status: "complete",
+        }
+      : null;
+  const displayedImportProgress = currentImportJob ?? importProgress ?? pendingImportProgress;
+  const currentInvoiceLocked =
+    busyAction !== null ||
+    currentImportJob !== null ||
+    Boolean(invoice && pendingImportRefreshes.has(invoice.id));
+
+  useEffect(() => {
+    if (
+      !invoice ||
+      busyAction !== null ||
+      currentImportJob !== null ||
+      !pendingImportRefreshes.has(invoice.id) ||
+      autosave.status !== "saved" ||
+      refreshingImportInvoicesRef.current.has(invoice.id)
+    ) {
+      return;
+    }
+    const invoiceId = invoice.id;
+    let cancelled = false;
+    refreshingImportInvoicesRef.current.add(invoiceId);
+    void window.receiptApp
+      .loadInvoice(invoiceId)
+      .then((document) => {
+        if (!cancelled && currentInvoiceRef.current?.id === invoiceId) {
+          refreshReceiptResources(invoiceId);
+          adoptInvoice(document);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          pushToast(
+            `Could not refresh the completed receipt scan: ${messageFromError(error)}`,
+            "error"
+          );
+        }
+      })
+      .finally(() => {
+        refreshingImportInvoicesRef.current.delete(invoiceId);
+        if (!cancelled) {
+          setPendingImportRefreshes((current) => {
+            const next = new Set(current);
+            next.delete(invoiceId);
+            return next;
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+      refreshingImportInvoicesRef.current.delete(invoiceId);
+    };
+  }, [
+    adoptInvoice,
+    autosave.status,
+    busyAction,
+    currentImportJob,
+    invoice,
+    pendingImportRefreshes,
+    pushToast,
+    refreshReceiptResources,
+  ]);
+
   const chooseFolder = useCallback(async (): Promise<SettingsView> => {
+    if (importJobs.jobs.size > 0 || pendingImportRefreshes.size > 0) {
+      throw new Error("Cancel or wait for active receipt scans before changing folders.");
+    }
     await autosave.flush();
     const previousFolder = settings?.baseFolder ?? null;
     const next = await window.receiptApp.chooseBaseFolder();
@@ -1243,6 +674,8 @@ export default function App() {
     autosave.reset,
     clearBuiltOutput,
     clearInvoiceCheck,
+    importJobs.jobs.size,
+    pendingImportRefreshes.size,
     settings?.baseFolder,
   ]);
 
@@ -1261,19 +694,34 @@ export default function App() {
 
   const openInvoice = async (invoiceId: string) => {
     if (busyAction || invoice?.id === invoiceId) return;
+    const previousInvoiceId = currentInvoiceRef.current?.id;
+    if (previousInvoiceId) {
+      setPendingImportRefreshes((current) => clearImportRefresh(current, previousInvoiceId));
+    }
+    openingInvoiceIdRef.current = invoiceId;
     setBusyAction("load");
     try {
       await autosave.flush();
-      adoptInvoice(await window.receiptApp.loadInvoice(invoiceId));
+      adoptInvoice(await window.receiptApp.loadInvoice(invoiceId), {
+        persistSort: !isInvoiceImportingRef.current(invoiceId),
+      });
     } catch (error) {
       pushToast(`Could not open invoice: ${messageFromError(error)}`, "error");
     } finally {
+      if (openingInvoiceIdRef.current === invoiceId) openingInvoiceIdRef.current = null;
+      if (currentInvoiceRef.current?.id !== invoiceId) {
+        setPendingImportRefreshes((current) => clearImportRefresh(current, invoiceId));
+      }
       setBusyAction(null);
     }
   };
 
   const reloadInvoiceFromDisk = async () => {
     if (!invoice || busyAction) return;
+    if (isInvoiceImportingRef.current(invoice.id)) {
+      pushToast("Cancel or wait for this invoice's receipt scan before reloading it.");
+      return;
+    }
     if (
       !window.confirm(
         "Reload the latest invoice from disk? Your unsaved table edits will be discarded."
@@ -1312,6 +760,12 @@ export default function App() {
   const removeActiveInvoice = async (hardDelete: boolean) => {
     const activeInvoice = currentInvoiceRef.current;
     if (!activeInvoice || busyActionRef.current) return;
+    if (isInvoiceImportingRef.current(activeInvoice.id)) {
+      setRemoveInvoiceError(
+        "Cancel or wait for the active receipt scan before removing this invoice."
+      );
+      return;
+    }
 
     const invoiceId = activeInvoice.id;
     busyActionRef.current = "remove-invoice";
@@ -1373,7 +827,7 @@ export default function App() {
       }
     } catch (error) {
       const errorMessage = messageFromError(error);
-      const revisionConflict = /revision|changed|conflict/i.test(errorMessage);
+      const revisionConflict = appErrorCode(error) === "REVISION_CONFLICT";
       setRemoveInvoiceConflict(revisionConflict);
       setRemoveInvoiceError(errorMessage);
       pushToast(`Could not remove invoice: ${errorMessage}`, "error");
@@ -1387,15 +841,23 @@ export default function App() {
 
   const updateRows = useCallback(
     (nextRows: InvoiceRow[]) => {
-      const orderedRows = sortInvoiceRows(nextRows, sortColumnsRef.current);
+      const activeInvoiceId = currentInvoiceRef.current?.id;
+      if (activeInvoiceId && isInvoiceImportingRef.current(activeInvoiceId)) return;
+      const orderedRows = rowsNeedResort(rows, nextRows, sortColumnsRef.current)
+        ? sortInvoiceRows(nextRows, sortColumnsRef.current)
+        : nextRows;
       clearInvoiceCheck();
       clearBuiltOutput();
       setRows(orderedRows);
       autosave.stage(orderedRows);
-      const orderedRowIds = new Set(orderedRows.map((row) => row.id));
-      setSelectedRows((current) => new Set([...current].filter((id) => orderedRowIds.has(id))));
+      setSelectedRows((current) => {
+        if (current.size === 0) return current;
+        const orderedRowIds = new Set(orderedRows.map((row) => row.id));
+        if ([...current].every((id) => orderedRowIds.has(id))) return current;
+        return new Set([...current].filter((id) => orderedRowIds.has(id)));
+      });
     },
-    [autosave.stage, clearBuiltOutput, clearInvoiceCheck]
+    [autosave.stage, clearBuiltOutput, clearInvoiceCheck, rows]
   );
 
   const handleSortColumnsChange = useCallback(
@@ -1414,6 +876,10 @@ export default function App() {
 
   const addManualRow = () => {
     if (!invoice) return;
+    if (isInvoiceImportingRef.current(invoice.id)) {
+      pushToast("Cancel or wait for this invoice's receipt scan before editing rows.");
+      return;
+    }
     const today = todayIso();
     const date =
       today >= invoice.period.startDate && today <= invoice.period.endDate
@@ -1449,6 +915,11 @@ export default function App() {
         pushToast("Wait for the current invoice action to finish.");
         return;
       }
+      if (isInvoiceImportingRef.current(invoice.id)) {
+        pushToast("Cancel or wait for this invoice's active receipt scan before adding more.");
+        return;
+      }
+      if (!confirmReceiptUpload()) return;
       clearBuiltOutput();
       setBusyAction("import");
       setImportProgress({
@@ -1463,44 +934,51 @@ export default function App() {
       });
       try {
         await autosave.flush();
-        let result = await window.receiptApp.importFiles(invoice.id, paths, { method });
-        const crossInvoiceDuplicates = result.duplicates.filter(
-          (duplicate) => !duplicate.sameInvoice
-        );
-        if (
-          crossInvoiceDuplicates.length > 0 &&
-          window.confirm(
-            `${crossInvoiceDuplicates.length} receipt${crossInvoiceDuplicates.length === 1 ? " was" : "s were"} already used in another invoice. Import ${crossInvoiceDuplicates.length === 1 ? "it" : "them"} here too?`
-          )
-        ) {
-          const duplicateResult = await window.receiptApp.importFiles(
-            invoice.id,
-            crossInvoiceDuplicates.map((duplicate) => duplicate.path),
-            { method, allowCrossInvoiceDuplicates: true }
-          );
-          result = {
-            invoice: duplicateResult.invoice,
-            importedCount: result.importedCount + duplicateResult.importedCount,
-            duplicates: [...result.duplicates, ...duplicateResult.duplicates],
-            errors: [...result.errors, ...duplicateResult.errors],
-          };
-        }
-        adoptInvoice(result.invoice);
-        if (result.importedCount > 0) {
+        const {
+          importedCount,
+          duplicates: allDuplicates,
+          errors: allErrors,
+        } = await startReceiptImportWorkflow({
+          api: window.receiptApp,
+          invoiceId: invoice.id,
+          paths,
+          method,
+          confirmCrossInvoiceDuplicates: (duplicates) =>
+            window.confirm(
+              `${duplicates.length} receipt${duplicates.length === 1 ? " was" : "s were"} already used in another invoice. Import ${duplicates.length === 1 ? "it" : "them"} here too?`
+            ),
+          onStarted: (result, startedPaths) => {
+            const jobActive = importJobs.registerJob({
+              jobId: result.jobId,
+              invoiceId: invoice.id,
+              total: startedPaths.length,
+              filename:
+                startedPaths.length === 1
+                  ? (startedPaths[0].split("/").pop() ?? "Receipt")
+                  : `${startedPaths.length} receipts`,
+            });
+            if (jobActive && currentInvoiceRef.current?.id === invoice.id) {
+              adoptInvoice(result.invoice, { persistSort: false });
+            }
+          },
+        });
+        if (importedCount > 0) {
           pushToast(
-            `${result.importedCount} receipt${result.importedCount === 1 ? "" : "s"} added.`,
+            settings?.hasOpenAiKey
+              ? `${importedCount} receipt${importedCount === 1 ? "" : "s"} added locally; scanning continues in the background.`
+              : `${importedCount} receipt${importedCount === 1 ? "" : "s"} added locally. Add an OpenAI key to scan ${importedCount === 1 ? "it" : "them"}.`,
             "success"
           );
         }
-        if (result.errors.length > 0) {
-          const [firstError] = result.errors;
-          const remaining = result.errors.length - 1;
+        if (allErrors.length > 0) {
+          const [firstError] = allErrors;
+          const remaining = allErrors.length - 1;
           pushToast(
             `${firstError.filename}: ${firstError.message}${remaining > 0 ? ` (+${remaining} more)` : ""}`,
             "error"
           );
         }
-        const skipped = result.duplicates.filter((duplicate) => duplicate.sameInvoice).length;
+        const skipped = allDuplicates.filter((duplicate) => duplicate.sameInvoice).length;
         if (skipped > 0) {
           pushToast(
             `${skipped} duplicate${skipped === 1 ? " was" : "s were"} already in this invoice.`
@@ -1513,7 +991,17 @@ export default function App() {
         setImportProgress(null);
       }
     },
-    [adoptInvoice, autosave.flush, busyAction, clearBuiltOutput, invoice, pushToast]
+    [
+      adoptInvoice,
+      autosave.flush,
+      busyAction,
+      clearBuiltOutput,
+      confirmReceiptUpload,
+      importJobs.registerJob,
+      invoice,
+      pushToast,
+      settings?.hasOpenAiKey,
+    ]
   );
 
   const chooseReceipts = async () => {
@@ -1530,6 +1018,10 @@ export default function App() {
     event.preventDefault();
     dragDepthRef.current = 0;
     setDraggingFiles(false);
+    if (commitActiveGridEditor(gridPanelRef.current) === "invalid") {
+      pushToast("Correct the active invoice cell before adding receipts.", "error");
+      return;
+    }
     if (!invoice) {
       pushToast("Create or open an invoice before adding receipts.", "error");
       return;
@@ -1559,12 +1051,18 @@ export default function App() {
       pushToast("Select one or more receipt rows to retry.");
       return;
     }
+    if (isInvoiceImportingRef.current(invoice.id)) {
+      pushToast("Cancel or wait for this invoice's active receipt scan before retrying.");
+      return;
+    }
+    if (!confirmReceiptUpload()) return;
     clearBuiltOutput();
     setBusyAction("retry");
     try {
       await autosave.flush();
       const uniqueReceiptIds = [...new Set(receiptIds)];
       const document = await window.receiptApp.retryReceipts(invoice.id, uniqueReceiptIds);
+      refreshReceiptResources(document.id);
       adoptInvoice(document);
       const retried = document.receipts.filter((receipt) => uniqueReceiptIds.includes(receipt.id));
       const completedCount = retried.filter(
@@ -1600,13 +1098,26 @@ export default function App() {
     void retryReceiptIds(retryableSelectedReceiptIds);
   };
 
-  const copyTsv = async () => {
+  const cancelBackgroundImport = async (jobId: string) => {
+    try {
+      const cancelled = await importJobs.cancelJob(jobId);
+      if (!cancelled) pushToast("That receipt scan has already finished.");
+    } catch (error) {
+      pushToast(`Could not cancel receipt scanning: ${messageFromError(error)}`, "error");
+    }
+  };
+
+  const copyTsv = async (scope: "all" | "selected") => {
     if (!invoice) return;
+    if (scope === "selected" && selectedRows.size === 0) {
+      pushToast("Select one or more invoice rows to copy.");
+      return;
+    }
     setBusyAction("copy");
     try {
       await autosave.flush();
-      const selected = selectedRows.size > 0 ? [...selectedRows] : null;
-      await window.receiptApp.copyTsv(invoice.id, selected, true, selected == null);
+      const selected = scope === "selected" ? [...selectedRows] : null;
+      await window.receiptApp.copyTsv(invoice.id, selected, true, scope === "all");
       pushToast(
         selected
           ? `${selected.length} selected row${selected.length === 1 ? "" : "s"} copied.`
@@ -1757,7 +1268,7 @@ export default function App() {
       pushToast(acknowledged ? "Review item checked off." : "Review item reopened.", "success");
     } catch (error) {
       const errorMessage = messageFromError(error);
-      const revisionConflict = /revision|changed|conflict/i.test(errorMessage);
+      const revisionConflict = appErrorCode(error) === "REVISION_CONFLICT";
       pushToast(
         `Could not update the review checklist: ${errorMessage}`,
         "error",
@@ -1824,6 +1335,7 @@ export default function App() {
   );
   const selectedReceiptCount = retryableSelectedReceiptIds.length;
   const detailRow = detailRowId ? (rows.find((row) => row.id === detailRowId) ?? null) : null;
+  const backgroundInert = drawerUsesOverlay && detailRow !== null;
   const detailReceipt =
     detailRow?.receiptId && invoice
       ? (invoice.receipts.find((receipt) => receipt.id === detailRow.receiptId) ?? null)
@@ -1849,6 +1361,13 @@ export default function App() {
     event.preventDefault();
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDraggingFiles(false);
+  };
+
+  const handleAppMouseDownCapture = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target === document.activeElement) return;
+    if (commitActiveGridEditor(gridPanelRef.current) !== "invalid") return;
+    event.preventDefault();
+    event.stopPropagation();
   };
 
   if (booting) {
@@ -1878,7 +1397,7 @@ export default function App() {
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: File drag events are delegated at the application boundary; the file picker remains the keyboard equivalent.
     <div
-      className="app-shell"
+      className={`app-shell${backgroundInert ? " app-shell--drawer-overlay" : ""}`}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={(event) => {
@@ -1888,17 +1407,24 @@ export default function App() {
         }
       }}
       onDrop={dropFiles}
+      onMouseDownCapture={handleAppMouseDownCapture}
     >
       <Sidebar
         activeInvoiceId={invoice?.id ?? null}
+        backgroundInert={backgroundInert}
         busy={busyAction != null}
+        importingInvoiceIds={importingInvoiceIds}
         invoices={invoices}
         onNew={() => setNewInvoiceOpen(true)}
         onOpen={(id) => void openInvoice(id)}
         onSettings={() => setSettingsOpen(true)}
       />
 
-      <main className="workspace">
+      <main
+        aria-hidden={backgroundInert || undefined}
+        className="workspace"
+        inert={backgroundInert || undefined}
+      >
         {bootError ? (
           <div className="workspace-error">
             <span aria-hidden="true">!</span>
@@ -1914,8 +1440,8 @@ export default function App() {
           <div className="key-banner">
             <span aria-hidden="true">!</span>
             <p role="status">
-              <strong>Add an OpenAI API key to scan receipts.</strong> Manual rows and exports still
-              work.
+              <strong>Add an OpenAI API key to scan receipts.</strong> Scanning sends the receipt
+              file to OpenAI for extraction. Manual rows and exports still work locally.
             </p>
             <button className="text-button" type="button" onClick={() => setSettingsOpen(true)}>
               Open Settings
@@ -1966,7 +1492,7 @@ export default function App() {
               <div className="toolbar-primary">
                 <button
                   className="button button--primary"
-                  disabled={busyAction != null}
+                  disabled={currentInvoiceLocked}
                   title="Open the file picker for one or many receipt images or PDFs"
                   type="button"
                   onClick={() => void chooseReceipts()}
@@ -1976,7 +1502,7 @@ export default function App() {
                 </button>
                 <button
                   className="button button--secondary"
-                  disabled={busyAction != null}
+                  disabled={currentInvoiceLocked}
                   type="button"
                   onClick={addManualRow}
                 >
@@ -1985,7 +1511,7 @@ export default function App() {
                 </button>
                 <button
                   className="button button--secondary"
-                  disabled={busyAction != null || selectedReceiptCount === 0}
+                  disabled={currentInvoiceLocked || selectedReceiptCount === 0}
                   title={
                     selectedReceiptCount === 0 ? "Select one or more receipt rows first" : undefined
                   }
@@ -1997,7 +1523,7 @@ export default function App() {
                 </button>
                 <button
                   className="button button--secondary"
-                  disabled={busyAction != null}
+                  disabled={currentInvoiceLocked}
                   title="Check for duplicate transactions, incomplete scans, and dates outside the invoice period"
                   type="button"
                   onClick={() => void runInvoiceCheck()}
@@ -2010,7 +1536,7 @@ export default function App() {
                 {selectedRows.size > 0 ? (
                   <button
                     className="button button--danger-quiet"
-                    disabled={busyAction != null}
+                    disabled={currentInvoiceLocked}
                     type="button"
                     onClick={() => void deleteSelected()}
                   >
@@ -2019,35 +1545,32 @@ export default function App() {
                 ) : null}
                 <button
                   className="button button--secondary"
-                  disabled={busyAction != null}
-                  title="Build the invoice PDF and unique receipt files, replacing any previous output"
+                  disabled={currentInvoiceLocked}
+                  title="Build the client PDF and unique receipt files, replacing any previous PDF output"
                   type="button"
                   onClick={() => void buildOutput()}
                 >
                   <span aria-hidden="true">▣</span>
-                  {busyAction === "build-output" ? "Building…" : "Build Output"}
+                  {busyAction === "build-output" ? "Building PDF…" : "Build PDF Output"}
                 </button>
+                <CopyInvoiceActions
+                  disabled={currentInvoiceLocked}
+                  selectedCount={selectedRows.size}
+                  onCopyAll={() => void copyTsv("all")}
+                  onCopySelected={() => void copyTsv("selected")}
+                />
                 <button
                   className="button button--secondary"
-                  disabled={busyAction != null}
-                  type="button"
-                  onClick={() => void copyTsv()}
-                >
-                  <span aria-hidden="true">⧉</span>
-                  Copy TSV
-                </button>
-                <button
-                  className="button button--secondary"
-                  disabled={busyAction != null}
+                  disabled={currentInvoiceLocked}
                   type="button"
                   onClick={() => setExportOpen(true)}
                 >
                   <span aria-hidden="true">⇧</span>
-                  Export…
+                  Export Spreadsheet…
                 </button>
                 <button
                   className="button button--danger-quiet"
-                  disabled={busyAction != null}
+                  disabled={currentInvoiceLocked}
                   type="button"
                   onClick={() => {
                     setRemoveInvoiceError(null);
@@ -2060,7 +1583,7 @@ export default function App() {
                 <button
                   aria-label="Reveal invoice in Finder"
                   className="icon-button icon-button--bordered"
-                  disabled={busyAction != null}
+                  disabled={currentInvoiceLocked}
                   title="Reveal in Finder"
                   type="button"
                   onClick={() => void revealInvoice()}
@@ -2072,7 +1595,7 @@ export default function App() {
 
             {invoiceCheckResult && checkSummaryVisible ? (
               <InvoiceCheckSummary
-                disabled={busyAction != null}
+                disabled={currentInvoiceLocked}
                 result={invoiceCheckResult}
                 updatingFingerprints={updatingReviewFingerprints}
                 onDismiss={dismissInvoiceCheck}
@@ -2084,7 +1607,7 @@ export default function App() {
 
             {builtOutput?.invoiceId === invoice.id ? (
               <OutputReadyBanner
-                disabled={busyAction != null}
+                disabled={currentInvoiceLocked}
                 revealing={busyAction === "reveal-output"}
                 result={builtOutput.result}
                 onDismiss={clearBuiltOutput}
@@ -2092,33 +1615,17 @@ export default function App() {
               />
             ) : null}
 
-            {importProgress ? (
-              <div className="import-progress" role="status" aria-live="polite">
-                <div className="import-progress-copy">
-                  <span className="progress-spinner" aria-hidden="true" />
-                  <strong>
-                    {importProgress.status === "copying"
-                      ? "Copying"
-                      : importProgress.status === "duplicate"
-                        ? "Checking duplicate"
-                        : importProgress.status === "error"
-                          ? "Import issue"
-                          : "Scanning"}
-                  </strong>
-                  <span title={importProgress.filename}>{importProgress.filename}</span>
-                  <small>
-                    {Math.min(importProgress.current, importProgress.total)} of{" "}
-                    {importProgress.total}
-                  </small>
-                </div>
-                <progress
-                  max={Math.max(importProgress.total, 1)}
-                  value={Math.min(importProgress.current, importProgress.total)}
-                />
-              </div>
+            {displayedImportProgress ? (
+              <ImportProgressPanel
+                cancelling={Boolean(
+                  currentImportJob?.jobId && importJobs.cancellingJobIds.has(currentImportJob.jobId)
+                )}
+                progress={displayedImportProgress}
+                onCancel={(jobId) => void cancelBackgroundImport(jobId)}
+              />
             ) : null}
 
-            <section className="grid-panel" aria-busy={busyAction != null}>
+            <section ref={gridPanelRef} className="grid-panel" aria-busy={currentInvoiceLocked}>
               <div className="grid-panel-heading">
                 <div>
                   <h2>Invoice rows</h2>
@@ -2136,12 +1643,13 @@ export default function App() {
               <InvoiceGrid
                 activeRowId={detailRowId}
                 checkIssuesByRow={checkIssuesByRow}
-                disabled={busyAction != null}
+                disabled={currentInvoiceLocked}
                 focusRowId={focusRowId}
                 receipts={invoice.receipts}
                 rows={rows}
                 selectedRows={selectedRows}
                 sortColumns={sortColumns}
+                totals={totals}
                 onDeleteSelected={() => void deleteSelected()}
                 onFocusRowHandled={() => setFocusRowId(null)}
                 onOpenRow={setDetailRowId}
@@ -2150,7 +1658,10 @@ export default function App() {
                 onSortColumnsChange={handleSortColumnsChange}
               />
               <div className="grid-help-line">
-                <span>Click a column header to sort. Double-click a cell to edit.</span>
+                <span>
+                  Select a cell and press Enter, or double-click, to edit. Use a Receipt button to
+                  open source and scan details.
+                </span>
                 <span>The file picker and drag-and-drop both accept one file or a batch.</span>
               </div>
             </section>
@@ -2161,8 +1672,9 @@ export default function App() {
       {detailRow && invoice ? (
         <ReceiptDrawer
           invoiceId={invoice.id}
+          resourceGeneration={receiptResourceGenerations.get(invoice.id) ?? 0}
           receipt={detailReceipt}
-          reviewDisabled={busyAction != null}
+          reviewDisabled={currentInvoiceLocked}
           reviewIssues={detailReviewIssues}
           row={detailRow}
           updatingFingerprints={updatingReviewFingerprints}

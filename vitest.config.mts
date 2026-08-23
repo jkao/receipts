@@ -12,14 +12,14 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.{ts,tsx}"],
     coverage: {
       provider: "v8",
       reportsDirectory: "coverage",
       reporter: ["text", "html", "lcov", "json-summary"],
       include: ["src/main/**/*.ts", "src/renderer/**/*.{ts,tsx}", "src/shared/**/*.ts"],
       exclude: [
-        "src/**/*.test.ts",
+        "src/**/*.test.{ts,tsx}",
         "src/main/index.ts",
         "src/renderer/global.d.ts",
         "src/renderer/main.tsx",
