@@ -15,6 +15,9 @@ export const INVOICE_EXPORT_HEADERS = [
   "Comment",
 ] as const;
 
+export const INVOICE_PAYMENT_NOTE =
+  "Please pay groceries and labour separately. Grand total is for reference only.";
+
 export interface InvoiceTabularOptions {
   rowIds?: string[] | null;
   includeHeaders?: boolean;
@@ -71,7 +74,7 @@ function totalRowsToCells(rows: readonly InvoiceRow[]): string[][] {
       formatMinorUnits(totals.labourMinor),
       "",
     ],
-    ["Grand Total", "", "", "", formatMinorUnits(totals.invoiceMinor), "Groceries + Labour"],
+    ["Grand Total", "", "", "", formatMinorUnits(totals.invoiceMinor), INVOICE_PAYMENT_NOTE],
   ];
 }
 

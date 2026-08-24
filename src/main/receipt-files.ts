@@ -1,9 +1,9 @@
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { createReadStream, lstatSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -46,15 +46,30 @@ export function managedReceiptFilename(sourcePath: string, sha256: string): stri
   const sourceExtension = path.extname(sourcePath);
   const extension = sourceExtension.toLowerCase();
   const base = path.basename(sourcePath, sourceExtension);
-  const sanitized =
-    base
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-zA-Z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 64)
-      .toLowerCase() || "receipt";
+  const sanitized = sanitizeFilenameSegment(base) || "receipt";
   return `r_${sha256.slice(0, 12)}__${sanitized}${extension}`;
+}
+
+/**
+ * Build the durable name used after a successful scan. Three-digit sequence
+ * numbers keep receipts from the same merchant and day in lexical order.
+ * A missing/invalid identity returns null so callers retain the collision-safe
+ * provisional filename instead of inventing purchase metadata.
+ */
+export function sortableReceiptFilename(
+  sourcePath: string,
+  date: string | null,
+  merchant: string | null,
+  sequence: number
+): string | null {
+  if (!isCanonicalCalendarDate(date) || !Number.isSafeInteger(sequence) || sequence < 1) {
+    return null;
+  }
+  const sanitizedMerchant = sanitizeFilenameSegment(merchant ?? "");
+  if (!sanitizedMerchant) return null;
+
+  const extension = path.extname(sourcePath).toLowerCase();
+  return `${date}-${sanitizedMerchant}-${String(sequence).padStart(3, "0")}${extension}`;
 }
 
 export async function readExtractionInput(sourcePath: string): Promise<{
@@ -186,4 +201,29 @@ function rejectSymlinkComponents(root: string, relativePath: string): void {
 
 function isMissingFile(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+export function sanitizeFilenameSegment(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .slice(0, 64)
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+}
+
+function isCanonicalCalendarDate(value: string | null): value is string {
+  if (value === null) return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day
+  );
 }

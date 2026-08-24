@@ -202,6 +202,44 @@ describe("receipt preload bridge", () => {
     revokeObjectUrl.mockRestore();
   });
 
+  it("keeps gallery thumbnails independent and releases them by receipt", async () => {
+    const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
+    const createObjectUrl = vi
+      .spyOn(URL, "createObjectURL")
+      .mockReturnValueOnce("blob:thumbnail-one")
+      .mockReturnValueOnce("blob:thumbnail-two");
+    const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    electron.invoke
+      .mockReset()
+      .mockResolvedValueOnce({
+        filename: "one.png",
+        mimeType: "image/png",
+        bytes: new Uint8Array([1]),
+        managedPath: "/managed/one.png",
+      })
+      .mockResolvedValueOnce({
+        filename: "two.png",
+        mimeType: "image/png",
+        bytes: new Uint8Array([2]),
+        managedPath: "/managed/two.png",
+      });
+
+    await expect(api.getReceiptThumbnail("invoice-1", "receipt-1")).resolves.toMatchObject({
+      dataUrl: "blob:thumbnail-one",
+    });
+    await expect(api.getReceiptThumbnail("invoice-1", "receipt-2")).resolves.toMatchObject({
+      dataUrl: "blob:thumbnail-two",
+    });
+
+    expect(revokeObjectUrl).not.toHaveBeenCalled();
+    api.releaseReceiptThumbnail("invoice-1", "receipt-1");
+    expect(revokeObjectUrl).toHaveBeenCalledWith("blob:thumbnail-one");
+    api.releaseReceiptThumbnail("invoice-1", "receipt-2");
+    expect(revokeObjectUrl).toHaveBeenCalledWith("blob:thumbnail-two");
+    createObjectUrl.mockRestore();
+    revokeObjectUrl.mockRestore();
+  });
+
   it("exposes the advisory invoice check IPC call", async () => {
     const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
     const result = {
@@ -249,6 +287,16 @@ describe("receipt preload bridge", () => {
     expect(electron.invoke).toHaveBeenCalledWith(IPC.invoicesRemove, "invoice-1", options);
   });
 
+  it("exposes revision-checked invoice period updates", async () => {
+    const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
+    const period = { startDate: "2026-02-01", endDate: "2026-02-28" };
+    const result = { id: "invoice-1", period, revision: 5 };
+    electron.invoke.mockResolvedValue(result);
+
+    await expect(api.updateInvoicePeriod("invoice-1", period, 4)).resolves.toBe(result);
+    expect(electron.invoke).toHaveBeenCalledWith(IPC.invoicesUpdatePeriod, "invoice-1", period, 4);
+  });
+
   it("exposes persisted review acknowledgement updates", async () => {
     const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
     const result = { invoice: { revision: 5 }, check: { revision: 5 } };
@@ -269,7 +317,11 @@ describe("receipt preload bridge", () => {
 
   it("exposes invoice output build and reveal calls", async () => {
     const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
-    const result = { outputPath: "/invoices/one/output", receiptCount: 3 };
+    const result = {
+      outputPath: "/invoices/one/output",
+      archivePath: "/invoices/one/output/invoice-2026-01-01-2026-01-31.zip",
+      receiptCount: 3,
+    };
     electron.invoke.mockReset();
     electron.invoke.mockResolvedValueOnce(result).mockResolvedValueOnce(undefined);
 

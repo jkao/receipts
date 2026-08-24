@@ -159,6 +159,29 @@ describe("receipt picker IPC", () => {
     expect(removeInvoice).toHaveBeenCalledWith("invoice-1", options);
   });
 
+  it("delegates revision-checked invoice period updates", async () => {
+    const result = {
+      id: "invoice-1",
+      period: { startDate: "2026-02-01", endDate: "2026-02-28" },
+      revision: 5,
+    };
+    const updateInvoicePeriod = vi.fn().mockResolvedValue(result);
+    registerIpcHandlers({
+      settings: {} as never,
+      invoices: { updateInvoicePeriod } as never,
+      checker: {} as never,
+      importer: {} as never,
+      trash: {} as never,
+      exporter: {} as never,
+      output: {} as never,
+      getWindow: () => ({}) as never,
+    });
+    const period = { startDate: "2026-02-01", endDate: "2026-02-28" };
+
+    await expect(invoke(IPC.invoicesUpdatePeriod, "invoice-1", period, 4)).resolves.toBe(result);
+    expect(updateInvoicePeriod).toHaveBeenCalledWith("invoice-1", period, 4);
+  });
+
   it("delegates persisted review acknowledgement updates with a revision", async () => {
     const result = { invoice: { revision: 4 }, check: { revision: 4 } };
     const setReviewAcknowledgement = vi.fn().mockResolvedValue(result);
@@ -181,7 +204,11 @@ describe("receipt picker IPC", () => {
   });
 
   it("delegates invoice output build and reveal through IPC", async () => {
-    const result = { outputPath: "/invoices/one/output", receiptCount: 2 };
+    const result = {
+      outputPath: "/invoices/one/output",
+      archivePath: "/invoices/one/output/invoice-2026-01-01-2026-01-31.zip",
+      receiptCount: 2,
+    };
     const buildInvoiceOutput = vi.fn().mockResolvedValue(result);
     const revealOutput = vi.fn().mockResolvedValue(undefined);
     registerIpcHandlers({

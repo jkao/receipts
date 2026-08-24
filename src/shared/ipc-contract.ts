@@ -41,6 +41,10 @@ export interface IpcRequestContract {
   [IPC.invoicesList]: Request<[], InvoiceSummary[]>;
   [IPC.invoicesCreate]: Request<[period: InvoicePeriod], InvoiceDocument>;
   [IPC.invoicesLoad]: Request<[invoiceId: string], InvoiceDocument>;
+  [IPC.invoicesUpdatePeriod]: Request<
+    [invoiceId: string, period: InvoicePeriod, expectedRevision: number],
+    InvoiceDocument
+  >;
   [IPC.invoicesRemove]: Request<
     [invoiceId: string, options: RemoveInvoiceOptions],
     InvoiceRemovalResult

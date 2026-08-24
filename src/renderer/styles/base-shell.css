@@ -116,15 +116,6 @@ p {
   background: var(--warm-100);
 }
 
-.app-shell--drawer-overlay::after {
-  position: fixed;
-  z-index: 20;
-  inset: 0;
-  background: rgb(22 28 24 / 28%);
-  pointer-events: none;
-  content: "";
-}
-
 .sidebar {
   z-index: 10;
   display: flex;
@@ -313,11 +304,6 @@ p {
   min-height: 0;
   flex-direction: column;
   overflow: auto;
-  transition: margin-right 180ms ease;
-}
-
-.app-shell:has(.receipt-drawer) .workspace {
-  margin-right: 410px;
 }
 
 .key-banner {
@@ -407,9 +393,27 @@ p {
   white-space: nowrap;
 }
 
-.workspace-title > span {
+.workspace-period {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.workspace-period > span {
   color: var(--ink-soft);
   font-size: 12px;
+}
+
+.workspace-period-edit {
+  min-height: 0;
+  padding: 0;
+  font-size: 11px;
+}
+
+.workspace-period-edit:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+  text-decoration: none;
 }
 
 .workspace-summary {

@@ -13,10 +13,12 @@ import type {
   InvoiceDocument,
   InvoiceRow,
   ReceiptDebug,
+  ReceiptExtraction,
   ReceiptRecord,
 } from "../shared/types";
-import { atomicWriteFile, isErrno } from "./atomic-file";
+import { atomicWriteFile, isErrno, syncDirectory } from "./atomic-file";
 import { ConcurrencyLimiter, mapBounded } from "./bounded-operations";
+import { applyScannedReceiptToRows } from "./invoice-row-consolidation";
 import type { InvoiceStore } from "./invoice-store";
 import { OpenAiReceiptClient } from "./openai";
 import {
@@ -28,6 +30,7 @@ import {
   readExtractionInput,
   resolveInside,
   sha256File,
+  sortableReceiptFilename,
   writeJsonAtomic,
 } from "./receipt-files";
 import { KeyedSerialQueue } from "./serial-queue";
@@ -70,6 +73,15 @@ interface DebugRollback {
   previousContents: Buffer | null;
 }
 
+interface ReceiptRenameJournal {
+  schemaVersion: 1;
+  invoiceId: string;
+  receiptId: string;
+  previousRelativePath: string;
+  nextRelativePath: string;
+  sha256: string;
+}
+
 interface ActiveImportJob {
   jobId: string;
   invoiceId: string;
@@ -95,10 +107,12 @@ class ReceiptStateRecoveryError extends Error {
 }
 
 export const RECEIPT_SCAN_CONCURRENCY = 2;
+export const RECEIPT_RENAME_JOURNAL_FILENAME = ".receipt-rename.json";
 
 export class ImportManager {
   private readonly preparationOperations = new KeyedSerialQueue<string>();
   private readonly scanOperations = new KeyedSerialQueue<string>();
+  private readonly receiptCommitOperations = new KeyedSerialQueue<string>();
   private readonly providerScans = new ConcurrencyLimiter(RECEIPT_SCAN_CONCURRENCY);
   private readonly activeJobs = new Map<string, ActiveImportJob>();
 
@@ -199,13 +213,17 @@ export class ImportManager {
 
     const invoice = await this.invoices.loadInvoice(invoiceId);
     const invoiceFolder = await this.invoices.getInvoiceFolder(invoice.name);
-    const receiptsById = new Map(invoice.receipts.map((receipt) => [receipt.id, receipt]));
+    await this.receiptCommitOperations.run(invoice.id, () =>
+      this.recoverReceiptRename(invoice.id, invoiceFolder)
+    );
+    const recoveredInvoice = await this.invoices.loadInvoice(invoice.id);
+    const receiptsById = new Map(recoveredInvoice.receipts.map((receipt) => [receipt.id, receipt]));
     const receipts = [...new Set(receiptIds)].flatMap((receiptId) => {
       const receipt = receiptsById.get(receiptId);
       return receipt ? [receipt] : [];
     });
     if (receipts.length === 0) {
-      return invoice;
+      return recoveredInvoice;
     }
     let client: ReceiptClient;
     try {
@@ -265,6 +283,9 @@ export class ImportManager {
     const duplicates: ImportDuplicate[] = [];
     const errors: Array<{ filename: string; message: string }> = [];
     const invoiceFolder = await this.invoices.getInvoiceFolder(invoice.name);
+    await this.receiptCommitOperations.run(invoiceId, () =>
+      this.recoverReceiptRename(invoiceId, invoiceFolder)
+    );
     const sources: HashedSource[] = [];
     for (let index = 0; index < uniquePaths.length; index += 1) {
       const sourcePath = uniquePaths[index];
@@ -748,20 +769,14 @@ export class ImportManager {
       // This mutation is the durable extraction commit point. Cancellation is
       // honored immediately above, but once this write is enqueued it wins the
       // race: never discard a successfully committed extraction afterward.
-      await this.invoices.mutateInvoice(invoiceId, (next) => {
-        const nextReceipt = next.receipts.find((item) => item.id === receipt.id);
-        if (!nextReceipt) {
-          throw new Error("Receipt was removed while it was scanning.");
-        }
-        nextReceipt.status = warnings.length > 0 ? "needs-review" : "ready";
-        delete nextReceipt.error;
-        const row = next.rows.find((item) => item.receiptId === receipt.id);
-        if (row) {
-          row.date = result.extraction.date;
-          row.groceriesMinor = groceriesMinor;
-          row.comment = result.extraction.merchant?.trim() || row.comment;
-        }
-      });
+      await this.commitScannedReceipt(
+        invoiceId,
+        invoiceFolder,
+        receipt.id,
+        result.extraction,
+        groceriesMinor,
+        warnings.length > 0 ? "needs-review" : "ready"
+      );
       extractionCommitted = true;
       this.progress(
         invoiceId,
@@ -808,6 +823,221 @@ export class ImportManager {
       );
       throw error;
     }
+  }
+
+  /**
+   * Keep managed-file naming and its persisted relative path in one serialized
+   * commit. The new path is copied before metadata changes, then the old path
+   * is unlinked afterward, so process interruption never leaves invoice.json
+   * pointing at a missing receipt. A journal makes either leftover copy
+   * recoverable on the next import/retry.
+   */
+  private async commitScannedReceipt(
+    invoiceId: string,
+    invoiceFolder: string,
+    receiptId: string,
+    extraction: ReceiptExtraction,
+    groceriesMinor: number | null,
+    status: ReceiptRecord["status"]
+  ): Promise<void> {
+    await this.receiptCommitOperations.run(invoiceId, async () => {
+      await this.recoverReceiptRename(invoiceId, invoiceFolder);
+      const currentInvoice = await this.invoices.loadInvoice(invoiceId);
+      const currentReceipt = currentInvoice.receipts.find((item) => item.id === receiptId);
+      if (!currentReceipt) {
+        throw new Error("Receipt was removed while it was scanning.");
+      }
+
+      const currentRelativePath = currentReceipt.relativePath;
+      const currentPath = resolveInside(invoiceFolder, currentRelativePath);
+      const nextFilename = await nextSortableReceiptFilename(
+        path.dirname(currentPath),
+        path.basename(currentPath),
+        extraction.date,
+        extraction.merchant
+      );
+      const nextRelativePath = nextFilename
+        ? path.join("receipts", nextFilename)
+        : currentRelativePath;
+      const nextPath = resolveInside(invoiceFolder, nextRelativePath);
+      const pathChanges = nextPath !== currentPath;
+      const journalPath = path.join(invoiceFolder, RECEIPT_RENAME_JOURNAL_FILENAME);
+      let copied = false;
+
+      if (pathChanges) {
+        const journal: ReceiptRenameJournal = {
+          schemaVersion: 1,
+          invoiceId,
+          receiptId,
+          previousRelativePath: currentRelativePath,
+          nextRelativePath,
+          sha256: currentReceipt.sha256,
+        };
+        const journalWrite = await atomicWriteFile(
+          journalPath,
+          `${JSON.stringify(journal, null, 2)}\n`,
+          { mode: 0o600 }
+        );
+        if (!journalWrite.directorySynced) {
+          await fs.rm(journalPath, { force: true }).catch(() => undefined);
+          throw new Error("Could not establish a durable receipt rename journal.");
+        }
+        try {
+          await fs.copyFile(currentPath, nextPath, fsConstants.COPYFILE_EXCL);
+          copied = true;
+          if ((await sha256File(nextPath)) !== currentReceipt.sha256) {
+            throw new Error("The managed receipt changed while its sortable copy was being made.");
+          }
+          await syncReceiptCopy(nextPath);
+        } catch (error) {
+          if (copied) await fs.rm(nextPath, { force: true }).catch(() => undefined);
+          await fs.rm(journalPath, { force: true }).catch(() => undefined);
+          throw error;
+        }
+      }
+
+      try {
+        await this.invoices.mutateInvoice(invoiceId, (next) => {
+          const nextReceipt = next.receipts.find((item) => item.id === receiptId);
+          if (!nextReceipt) {
+            throw new Error("Receipt was removed while it was scanning.");
+          }
+          if (nextReceipt.relativePath !== currentRelativePath) {
+            throw new Error("Receipt path changed while its scan was being saved.");
+          }
+          nextReceipt.relativePath = nextRelativePath;
+          nextReceipt.status = status;
+          delete nextReceipt.error;
+          applyScannedReceiptToRows(
+            next.rows,
+            receiptId,
+            {
+              date: extraction.date,
+              groceriesMinor,
+              merchant: extraction.merchant,
+            },
+            {
+              defaultRateMinor: next.defaultRateMinor,
+              createRowId: () => `row_${crypto.randomUUID()}`,
+            }
+          );
+        });
+      } catch (error) {
+        if (!pathChanges) throw error;
+        try {
+          await fs.rm(nextPath, { force: true });
+          await fs.rm(journalPath, { force: true });
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            "Could not save the scanned receipt or remove its uncommitted sortable copy."
+          );
+        }
+        throw error;
+      }
+
+      if (pathChanges) {
+        try {
+          await fs.rm(currentPath);
+          await fs.rm(journalPath, { force: true });
+        } catch {
+          // Metadata already points at the verified new copy. Keep the journal
+          // so a later import/retry can finish removing the prior path.
+        }
+      }
+    });
+  }
+
+  private async recoverReceiptRename(invoiceId: string, invoiceFolder: string): Promise<void> {
+    const journalPath = path.join(invoiceFolder, RECEIPT_RENAME_JOURNAL_FILENAME);
+    let journal: ReceiptRenameJournal;
+    try {
+      const metadata = await fs.lstat(journalPath);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) {
+        throw new Error(`${RECEIPT_RENAME_JOURNAL_FILENAME} must be an ordinary file.`);
+      }
+      journal = validateReceiptRenameJournal(JSON.parse(await fs.readFile(journalPath, "utf8")));
+    } catch (error) {
+      if (isErrno(error, "ENOENT")) return;
+      if (error instanceof SyntaxError) {
+        throw new Error(`Invalid ${RECEIPT_RENAME_JOURNAL_FILENAME}: ${error.message}`);
+      }
+      throw error;
+    }
+    if (journal.invoiceId !== invoiceId) {
+      throw new Error("Receipt rename journal belongs to a different invoice.");
+    }
+
+    const invoice = await this.invoices.loadInvoice(invoiceId);
+    const receipt = invoice.receipts.find((item) => item.id === journal.receiptId);
+    const previousPath = resolveInside(invoiceFolder, journal.previousRelativePath);
+    const nextPath = resolveInside(invoiceFolder, journal.nextRelativePath);
+    if (!receipt) {
+      if (
+        invoice.receipts.some(
+          (item) =>
+            item.relativePath === journal.previousRelativePath ||
+            item.relativePath === journal.nextRelativePath
+        )
+      ) {
+        throw new Error("A pending receipt rename path is now used by another receipt.");
+      }
+      for (const managedPath of [previousPath, nextPath]) {
+        if (!(await pathExists(managedPath))) continue;
+        if ((await sha256File(managedPath)) !== journal.sha256) {
+          throw new Error("An orphaned receipt rename path has unexpected contents.");
+        }
+        await fs.rm(managedPath);
+      }
+      await fs.rm(journalPath, { force: true });
+      return;
+    }
+    if (receipt.sha256 !== journal.sha256) {
+      throw new Error("Receipt rename journal does not match the saved receipt.");
+    }
+
+    if (receipt.relativePath === journal.previousRelativePath) {
+      if (!(await pathExists(previousPath))) {
+        if (!(await pathExists(nextPath)) || (await sha256File(nextPath)) !== journal.sha256) {
+          throw new Error("Cannot recover the missing previous receipt path.");
+        }
+        await fs.copyFile(nextPath, previousPath, fsConstants.COPYFILE_EXCL);
+        await syncReceiptCopy(previousPath);
+      }
+      if ((await sha256File(previousPath)) !== journal.sha256) {
+        throw new Error("The previous receipt path does not match its rename journal.");
+      }
+      if (await pathExists(nextPath)) {
+        if ((await sha256File(nextPath)) !== journal.sha256) {
+          throw new Error("The uncommitted sortable receipt copy has unexpected contents.");
+        }
+        await fs.rm(nextPath);
+      }
+    } else if (receipt.relativePath === journal.nextRelativePath) {
+      if (!(await pathExists(nextPath))) {
+        if (
+          !(await pathExists(previousPath)) ||
+          (await sha256File(previousPath)) !== journal.sha256
+        ) {
+          throw new Error("Cannot recover the missing sortable receipt path.");
+        }
+        await fs.copyFile(previousPath, nextPath, fsConstants.COPYFILE_EXCL);
+        await syncReceiptCopy(nextPath);
+      }
+      if ((await sha256File(nextPath)) !== journal.sha256) {
+        throw new Error("The sortable receipt path does not match its rename journal.");
+      }
+      if (await pathExists(previousPath)) {
+        if ((await sha256File(previousPath)) !== journal.sha256) {
+          throw new Error("The prior receipt path has unexpected contents.");
+        }
+        await fs.rm(previousPath);
+      }
+    } else {
+      throw new Error("Receipt path does not match its pending rename journal.");
+    }
+
+    await fs.rm(journalPath, { force: true });
   }
 
   private async setReceiptState(
@@ -919,6 +1149,50 @@ async function rollbackCopiedFiles(copied: CopiedReceipt[], cause: unknown): Pro
     : `${message} Could not remove ${cleanupFailures} copied file${cleanupFailures === 1 ? "" : "s"}; inspect the invoice receipts folder.`;
 }
 
+function validateReceiptRenameJournal(value: unknown): ReceiptRenameJournal {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Receipt rename journal must contain an object.");
+  }
+  const journal = value as Partial<ReceiptRenameJournal>;
+  if (
+    journal.schemaVersion !== 1 ||
+    typeof journal.invoiceId !== "string" ||
+    journal.invoiceId.trim() === "" ||
+    typeof journal.receiptId !== "string" ||
+    journal.receiptId.trim() === "" ||
+    !isDirectReceiptPath(journal.previousRelativePath) ||
+    !isDirectReceiptPath(journal.nextRelativePath) ||
+    journal.previousRelativePath === journal.nextRelativePath ||
+    typeof journal.sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(journal.sha256)
+  ) {
+    throw new Error("Receipt rename journal is invalid.");
+  }
+  return journal as ReceiptRenameJournal;
+}
+
+function isDirectReceiptPath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    !path.isAbsolute(value) &&
+    path.normalize(value) === value &&
+    path.dirname(value) === "receipts" &&
+    path.basename(value) !== ""
+  );
+}
+
+async function syncReceiptCopy(filePath: string): Promise<void> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  if (!(await syncDirectory(path.dirname(filePath)))) {
+    throw new Error("Could not durably save the sortable receipt copy.");
+  }
+}
+
 async function availableFilename(
   directory: string,
   desired: string,
@@ -931,6 +1205,41 @@ async function availableFilename(
   const extension = path.extname(desired);
   const base = path.basename(desired, extension);
   return `${base}-${suffix}${extension}`;
+}
+
+async function nextSortableReceiptFilename(
+  directory: string,
+  currentFilename: string,
+  date: string | null,
+  merchant: string | null
+): Promise<string | null> {
+  const first = sortableReceiptFilename(currentFilename, date, merchant, 1);
+  if (!first) return null;
+
+  const firstExtension = path.extname(first);
+  const firstStem = path.basename(first, firstExtension);
+  const prefix = firstStem.slice(0, -3);
+  const currentStem = path.basename(currentFilename, path.extname(currentFilename));
+  const currentSequence = sequenceForPrefix(currentStem, prefix);
+  if (currentSequence !== null) {
+    return currentFilename;
+  }
+
+  let highestSequence = 0;
+  for (const entry of await fs.readdir(directory)) {
+    const stem = path.basename(entry, path.extname(entry));
+    const sequence = sequenceForPrefix(stem, prefix);
+    if (sequence !== null) highestSequence = Math.max(highestSequence, sequence);
+  }
+  return sortableReceiptFilename(currentFilename, date, merchant, highestSequence + 1);
+}
+
+function sequenceForPrefix(stem: string, prefix: string): number | null {
+  if (!stem.startsWith(prefix)) return null;
+  const suffix = stem.slice(prefix.length);
+  if (!/^\d{3,}$/.test(suffix)) return null;
+  const sequence = Number(suffix);
+  return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : null;
 }
 
 function humanizeFilename(filePath: string): string {

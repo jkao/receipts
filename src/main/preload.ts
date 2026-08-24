@@ -7,6 +7,8 @@ import type { DesktopApi, ImportProgress, ReceiptPreview } from "../shared/types
 const authorizedImportPaths = new Set<string>();
 let activePreviewUrl: string | null = null;
 let previewRequestSequence = 0;
+const activeThumbnailUrls = new Map<string, string>();
+const thumbnailRequestSequences = new Map<string, number>();
 
 async function invoke<Channel extends IpcRequestChannel>(
   channel: Channel,
@@ -31,6 +33,19 @@ function releaseReceiptPreview(): void {
   // URL. A late IPC response must not recreate a Blob after its drawer closed.
   previewRequestSequence += 1;
   revokeActivePreviewUrl();
+}
+
+function receiptThumbnailKey(invoiceId: string, receiptId: string): string {
+  return JSON.stringify([invoiceId, receiptId]);
+}
+
+function releaseReceiptThumbnail(invoiceId: string, receiptId: string): void {
+  const key = receiptThumbnailKey(invoiceId, receiptId);
+  thumbnailRequestSequences.set(key, (thumbnailRequestSequences.get(key) ?? 0) + 1);
+  const activeUrl = activeThumbnailUrls.get(key);
+  if (!activeUrl) return;
+  URL.revokeObjectURL(activeUrl);
+  activeThumbnailUrls.delete(key);
 }
 
 function authorizeImportPath(filePath: string): string {
@@ -91,6 +106,41 @@ async function getReceiptPreview(invoiceId: string, receiptId: string): Promise<
   };
 }
 
+async function getReceiptThumbnail(invoiceId: string, receiptId: string): Promise<ReceiptPreview> {
+  const key = receiptThumbnailKey(invoiceId, receiptId);
+  const requestSequence = (thumbnailRequestSequences.get(key) ?? 0) + 1;
+  thumbnailRequestSequences.set(key, requestSequence);
+  const previousUrl = activeThumbnailUrls.get(key);
+  if (previousUrl) {
+    URL.revokeObjectURL(previousUrl);
+    activeThumbnailUrls.delete(key);
+  }
+
+  const payload = await invoke(IPC.receiptPreview, invoiceId, receiptId);
+  if (thumbnailRequestSequences.get(key) !== requestSequence) {
+    throw new Error("A newer receipt thumbnail was requested.");
+  }
+  if (!(payload.bytes instanceof Uint8Array)) {
+    throw new Error("The receipt thumbnail returned invalid binary data.");
+  }
+
+  const sourceBuffer = payload.bytes.buffer;
+  const blobBuffer =
+    sourceBuffer instanceof ArrayBuffer &&
+    payload.bytes.byteOffset === 0 &&
+    payload.bytes.byteLength === sourceBuffer.byteLength
+      ? sourceBuffer
+      : Uint8Array.from(payload.bytes).buffer;
+  const thumbnailUrl = URL.createObjectURL(new Blob([blobBuffer], { type: payload.mimeType }));
+  activeThumbnailUrls.set(key, thumbnailUrl);
+  return {
+    filename: payload.filename,
+    mimeType: payload.mimeType,
+    dataUrl: thumbnailUrl,
+    managedPath: payload.managedPath,
+  };
+}
+
 const api: DesktopApi = {
   getSettings: () => invoke(IPC.settingsGet),
   chooseBaseFolder: () => invoke(IPC.settingsChooseBase),
@@ -101,6 +151,8 @@ const api: DesktopApi = {
   listInvoices: () => invoke(IPC.invoicesList),
   createInvoice: (period) => invoke(IPC.invoicesCreate, period),
   loadInvoice: (invoiceId) => invoke(IPC.invoicesLoad, invoiceId),
+  updateInvoicePeriod: (invoiceId, period, expectedRevision) =>
+    invoke(IPC.invoicesUpdatePeriod, invoiceId, period, expectedRevision),
   removeInvoice: (invoiceId, options) => invoke(IPC.invoicesRemove, invoiceId, options),
   checkInvoice: (invoiceId) => invoke(IPC.invoicesCheck, invoiceId),
   setReviewAcknowledgement: (invoiceId, fingerprint, acknowledged, expectedRevision) =>
@@ -129,6 +181,8 @@ const api: DesktopApi = {
   undoLastDelete: (invoiceId) => invoke(IPC.rowsUndoDelete, invoiceId),
   getReceiptPreview,
   releaseReceiptPreview,
+  getReceiptThumbnail,
+  releaseReceiptThumbnail,
   getReceiptDebug: (invoiceId, receiptId) => invoke(IPC.receiptDebug, invoiceId, receiptId),
   copyTsv: (invoiceId, rowIds, includeHeaders, includeTotals) =>
     invoke(IPC.invoiceCopyTsv, invoiceId, rowIds, includeHeaders, includeTotals),

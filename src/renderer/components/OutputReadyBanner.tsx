@@ -28,7 +28,7 @@ export function OutputReadyBanner({
           <div>
             <h2 id={titleId}>Output ready</h2>
             <p role="status">
-              Built the invoice PDF and {result.receiptCount} unique receipt file
+              Built the invoice PDF, ZIP archive, and {result.receiptCount} unique receipt file
               {result.receiptCount === 1 ? "" : "s"}. Any previous output was replaced.
             </p>
           </div>

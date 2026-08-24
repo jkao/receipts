@@ -170,9 +170,17 @@
   border-bottom: 1px solid var(--line);
 }
 
-.modal-header > div {
+.modal-header-copy {
   display: grid;
+  min-width: 0;
   gap: 4px;
+}
+
+.modal-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
 }
 
 .modal-header h2 {
@@ -301,7 +309,7 @@
   gap: 8px;
 }
 
-.folder-setting code {
+.folder-path {
   display: block;
   width: 100%;
   overflow: hidden;
@@ -314,6 +322,20 @@
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.folder-path--expanded {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.folder-setting-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .key-status {

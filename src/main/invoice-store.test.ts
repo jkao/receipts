@@ -5,9 +5,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { InvoiceDocument, InvoicePeriod, InvoiceRow, ReceiptRecord } from "../shared/types";
-import { invoiceDocumentFingerprint } from "./invoice-codec";
+import { invoiceDocumentFingerprint, validateInvoiceDocument } from "./invoice-codec";
 import {
   BaseFolderNotConfiguredError,
+  INVOICE_PERIOD_UPDATE_FILENAME,
   INVOICE_VIEW_REPAIR_CONCURRENCY,
   INVOICE_VIEW_STATE_FILENAME,
   InvoiceDeletedError,
@@ -101,7 +102,7 @@ describe("InvoiceStore", () => {
     expect(await fs.readFile(path.join(folder, "invoice.tsv"), "utf8")).toBe(
       "Date\tGroceries MP\tHours Worked\tRate\tLabour Total\tComment\n" +
         "Total\t0.00\t0.00\t\t0.00\t\n" +
-        "Grand Total\t\t\t\t0.00\tGroceries + Labour\n"
+        "Grand Total\t\t\t\t0.00\tPlease pay groceries and labour separately. Grand total is for reference only.\n"
     );
     expect(await fs.readFile(path.join(folder, "invoice.csv"), "utf8")).toContain(
       "Date,Groceries MP,Hours Worked,Rate,Labour Total,Comment"
@@ -339,6 +340,150 @@ describe("InvoiceStore", () => {
     await expect(
       store.createInvoice({ startDate: "2026-03-02", endDate: "2026-03-01" })
     ).rejects.toBeInstanceOf(InvoiceValidationError);
+  });
+
+  it("updates an invoice period by renaming its folder and preserving its contents", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const populated = await store.mutateInvoice(created.id, (draft) => {
+      draft.rows.push(row());
+      draft.receipts.push(receipt());
+    });
+    const oldFolder = await store.getInvoiceFolder(created.id);
+    const nextPeriod = { startDate: "2026-01-05", endDate: "2026-02-04" };
+
+    const updated = await store.updateInvoicePeriod(created.id, nextPeriod, populated.revision);
+    const nextFolder = path.join(baseFolder, "invoice-2026-01-05-2026-02-04");
+
+    expect(updated).toMatchObject({
+      id: created.id,
+      name: "invoice-2026-01-05-2026-02-04",
+      period: nextPeriod,
+      revision: populated.revision + 1,
+      rows: populated.rows,
+      receipts: populated.receipts,
+    });
+    await expect(fs.access(oldFolder)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(nextFolder, "receipts"))).resolves.toMatchObject({});
+    await expect(store.getInvoiceFolder(created.id)).resolves.toBe(nextFolder);
+    await expect(store.loadInvoice(updated.name)).resolves.toEqual(updated);
+    const backup = validateInvoiceDocument(
+      JSON.parse(await fs.readFile(path.join(nextFolder, "invoice.json.bak"), "utf8"))
+    );
+    expect(backup).toMatchObject({
+      id: created.id,
+      name: updated.name,
+      period: nextPeriod,
+      revision: populated.revision,
+    });
+
+    const saved = await store.saveRows(
+      updated.id,
+      [row({ comment: "After move" })],
+      updated.revision
+    );
+    expect(saved.rows[0].comment).toBe("After move");
+    expect(await fs.readFile(path.join(nextFolder, "invoice.tsv"), "utf8")).toContain("After move");
+  });
+
+  it("revision-checks period updates and refuses to replace another invoice folder", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const occupiedPeriod = { startDate: "2026-02-01", endDate: "2026-02-28" };
+    await store.createInvoice(occupiedPeriod, 4500);
+
+    await expect(
+      store.updateInvoicePeriod(created.id, occupiedPeriod, created.revision)
+    ).rejects.toThrow(/already exists/i);
+    await expect(
+      store.updateInvoicePeriod(
+        created.id,
+        { startDate: "2026-01-02", endDate: "2026-01-31" },
+        created.revision + 1
+      )
+    ).rejects.toBeInstanceOf(RevisionConflictError);
+    await expect(store.loadInvoice(created.id)).resolves.toMatchObject({
+      name: created.name,
+      period: PERIOD,
+      revision: created.revision,
+    });
+  });
+
+  it("treats saving an unchanged invoice period as a no-op", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+
+    await expect(store.updateInvoicePeriod(created.id, PERIOD, created.revision)).resolves.toEqual(
+      created
+    );
+    expect((await store.loadInvoice(created.id)).revision).toBe(created.revision);
+  });
+
+  it("recovers an interrupted period update after the folder move", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const oldFolder = await store.getInvoiceFolder(created.id);
+    const nextPeriod = { startDate: "2026-01-02", endDate: "2026-02-01" };
+    const nextName = "invoice-2026-01-02-2026-02-01";
+    const nextFolder = path.join(baseFolder, nextName);
+    const marker = {
+      schemaVersion: 1,
+      invoiceId: created.id,
+      previousName: created.name,
+      previousPeriod: created.period,
+      previousRevision: created.revision,
+      previousUpdatedAt: created.updatedAt,
+      nextName,
+      nextPeriod,
+      nextRevision: created.revision + 1,
+      nextUpdatedAt: "2026-02-01T00:00:01.000Z",
+    };
+    await fs.writeFile(
+      path.join(oldFolder, INVOICE_PERIOD_UPDATE_FILENAME),
+      `${JSON.stringify(marker)}\n`,
+      "utf8"
+    );
+    await fs.rename(oldFolder, nextFolder);
+
+    const recovered = await store.loadInvoice(created.id);
+
+    expect(recovered).toMatchObject({
+      id: created.id,
+      name: nextName,
+      period: nextPeriod,
+      revision: 1,
+      updatedAt: marker.nextUpdatedAt,
+    });
+    await expect(
+      fs.access(path.join(nextFolder, INVOICE_PERIOD_UPDATE_FILENAME))
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      validateInvoiceDocument(
+        JSON.parse(await fs.readFile(path.join(nextFolder, "invoice.json.bak"), "utf8"))
+      )
+    ).toMatchObject({ name: nextName, period: nextPeriod, revision: 0 });
+  });
+
+  it("abandons a prepared period update that stopped before the folder move", async () => {
+    const created = await store.createInvoice(PERIOD, 4500);
+    const folder = await store.getInvoiceFolder(created.id);
+    await fs.writeFile(
+      path.join(folder, INVOICE_PERIOD_UPDATE_FILENAME),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        invoiceId: created.id,
+        previousName: created.name,
+        previousPeriod: created.period,
+        previousRevision: created.revision,
+        previousUpdatedAt: created.updatedAt,
+        nextName: "invoice-2026-01-02-2026-02-01",
+        nextPeriod: { startDate: "2026-01-02", endDate: "2026-02-01" },
+        nextRevision: created.revision + 1,
+        nextUpdatedAt: "2026-02-01T00:00:01.000Z",
+      })}\n`,
+      "utf8"
+    );
+
+    await expect(store.loadInvoice(created.id)).resolves.toEqual(created);
+    await expect(
+      fs.access(path.join(folder, INVOICE_PERIOD_UPDATE_FILENAME))
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("saves rows atomically, retains the prior JSON, and enforces revisions", async () => {

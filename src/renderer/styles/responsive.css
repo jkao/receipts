@@ -48,10 +48,6 @@
     justify-content: flex-start;
     margin-left: 0;
   }
-
-  .app-shell:has(.receipt-drawer) .workspace {
-    margin-right: 0;
-  }
 }
 
 @media (max-width: 720px) {
@@ -115,7 +111,6 @@
     display: none;
   }
 
-  /* biome-ignore lint/style/noDescendingSpecificity: This narrow-layout flex rule is independent of the medium-layout drawer margin override. */
   .workspace {
     flex: 1;
   }
@@ -160,6 +155,16 @@
     align-items: flex-start;
     flex-direction: column;
     gap: 4px;
+  }
+
+  .grid-panel-heading {
+    align-items: flex-start;
+  }
+
+  .grid-panel-heading-actions {
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 5px;
   }
 
   .modal-backdrop {

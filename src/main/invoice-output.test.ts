@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INVOICE_SCHEMA_VERSION, type InvoiceDocument, type ReceiptRecord } from "../shared/types";
@@ -17,6 +19,8 @@ vi.mock("electron", () => ({
 
 import { buildInvoiceHtml, InvoiceOutputBuilder, OUTPUT_FILE_CONCURRENCY } from "./invoice-output";
 import { InvoiceStore } from "./invoice-store";
+
+const execFileAsync = promisify(execFile);
 
 describe("invoice output HTML", () => {
   it("escapes all invoice data and renders rows plus exact totals", () => {
@@ -63,6 +67,9 @@ describe("invoice output HTML", () => {
     expect(html).toContain("$10.73");
     expect(html).toContain("$67.50");
     expect(html).toContain("$78.23");
+    expect(html).toContain(
+      "Payment note: Please pay groceries and labour separately. Grand total is for reference only."
+    );
     expect(html).toContain("thead { display: table-header-group; }");
     expect(html).toContain("page-break-inside: avoid");
     expect(html).not.toContain("f".repeat(64));
@@ -142,27 +149,84 @@ describe("InvoiceOutputBuilder", () => {
 
     expect(result).toEqual({
       outputPath: path.join(invoiceFolder, "output"),
+      archivePath: path.join(invoiceFolder, "output", "invoice-2026-08-01-2026-08-31.zip"),
       receiptCount: 2,
     });
     expect(await fs.readFile(path.join(result.outputPath, "invoice.pdf"))).toEqual(
       pdfBuffer("new invoice")
     );
     expect(await fs.readdir(path.join(result.outputPath, "receipts"))).toEqual([
-      "first.png",
-      "third.pdf",
+      "undated-receipt-0.png",
+      "undated-receipt-1.pdf",
     ]);
-    expect(await fs.readFile(path.join(result.outputPath, "receipts", "first.png"))).toEqual(
-      sameBytes
-    );
-    expect(await fs.readFile(path.join(result.outputPath, "receipts", "third.pdf"))).toEqual(
-      uniqueBytes
-    );
+    expect(
+      await fs.readFile(path.join(result.outputPath, "receipts", "undated-receipt-0.png"))
+    ).toEqual(sameBytes);
+    expect(
+      await fs.readFile(path.join(result.outputPath, "receipts", "undated-receipt-1.pdf"))
+    ).toEqual(uniqueBytes);
+    expect((await fs.readdir(result.outputPath)).sort()).toEqual([
+      "invoice-2026-08-01-2026-08-31.zip",
+      "invoice.pdf",
+      "receipts",
+    ]);
+    const archiveEntries = (
+      await execFileAsync("/usr/bin/unzip", ["-Z1", result.archivePath])
+    ).stdout
+      .trim()
+      .split("\n")
+      .sort();
+    expect(archiveEntries).toEqual([
+      "invoice.pdf",
+      "receipts/",
+      "receipts/undated-receipt-0.png",
+      "receipts/undated-receipt-1.pdf",
+    ]);
     expect(await fs.readdir(invoiceFolder)).not.toContain(".output.tmp-successful-build");
     expect(await fs.readdir(invoiceFolder)).not.toContain(".output.backup-successful-build");
     expect(renderPdf).toHaveBeenCalledOnce();
 
     await builder.revealOutput(invoice.id);
     expect(revealPath).toHaveBeenCalledWith(result.outputPath);
+  });
+
+  it("names exported receipts from row dates and comments with duplicate indexes", async () => {
+    const invoice = await createInvoice(store);
+    const invoiceFolder = await store.getInvoiceFolder(invoice.id);
+    const inputs = [
+      receiptInput("wf-first", "r_aaaaaaaaaaaa__legacy-wf.jpeg", Buffer.from("wf one")),
+      receiptInput("wf-second", "r_bbbbbbbbbbbb__legacy-wf.pdf", Buffer.from("wf two")),
+      receiptInput("parking", "r_cccccccccccc__parking.png", Buffer.from("parking")),
+    ];
+    await addReceipts(store, invoice.id, invoiceFolder, inputs);
+    await store.mutateInvoice(invoice.id, (draft) => {
+      draft.rows.push(
+        {
+          ...outputRow("wf-row-1", "2026-01-01", "WF"),
+          receiptId: "receipt-wf-first",
+        },
+        {
+          ...outputRow("wf-row-2", "2026-01-01", "WF"),
+          receiptId: "receipt-wf-second",
+        },
+        {
+          ...outputRow("parking-row", "2026-01-02", "Lincoln / Parking"),
+          receiptId: "receipt-parking",
+        }
+      );
+    });
+    const builder = new InvoiceOutputBuilder(store, {
+      renderPdf: async () => pdfBuffer("named receipts"),
+      nonce: () => "named-receipts",
+    });
+
+    const result = await builder.buildInvoiceOutput(invoice.id);
+
+    expect(await fs.readdir(path.join(result.outputPath, "receipts"))).toEqual([
+      "2026-01-01-wf-0.jpeg",
+      "2026-01-01-wf-1.pdf",
+      "2026-01-02-lincoln-parking-0.png",
+    ]);
   });
 
   it("bounds concurrent receipt copies while staging client output", async () => {

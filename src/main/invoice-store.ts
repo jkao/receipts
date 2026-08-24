@@ -77,8 +77,23 @@ interface DiscoveredInvoice {
 }
 
 export const INVOICE_VIEW_STATE_FILENAME = ".invoice-views.json";
+export const INVOICE_PERIOD_UPDATE_FILENAME = ".invoice-period-update.json";
 export const INVOICE_VIEW_REPAIR_CONCURRENCY = 4;
 const INVOICE_VIEW_FILENAMES = ["invoice.tsv", "invoice.csv"] as const;
+const INVOICE_PERIOD_UPDATE_SCHEMA_VERSION = 1 as const;
+
+interface InvoicePeriodUpdateMarker {
+  schemaVersion: typeof INVOICE_PERIOD_UPDATE_SCHEMA_VERSION;
+  invoiceId: string;
+  previousName: string;
+  previousPeriod: InvoicePeriod;
+  previousRevision: number;
+  previousUpdatedAt: string;
+  nextName: string;
+  nextPeriod: InvoicePeriod;
+  nextRevision: number;
+  nextUpdatedAt: string;
+}
 
 export class RevisionConflictError extends Error {
   readonly invoiceId: string;
@@ -158,6 +173,53 @@ function invoiceFolderName(period: InvoicePeriod): string {
   return `invoice-${period.startDate}-${period.endDate}`;
 }
 
+function canonicalTimestamp(value: unknown, label: string): string {
+  const timestamp = requiredString(value, label);
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== timestamp) {
+    throw new InvoiceValidationError(`${label} must be a canonical ISO timestamp`);
+  }
+  return timestamp;
+}
+
+function validateInvoicePeriodUpdateMarker(value: unknown): InvoicePeriodUpdateMarker {
+  if (!isRecord(value) || value.schemaVersion !== INVOICE_PERIOD_UPDATE_SCHEMA_VERSION) {
+    throw new InvoiceValidationError("Invoice period update marker is invalid");
+  }
+  const invoiceId = requiredString(value.invoiceId, "Period update invoice id");
+  const previousName = requiredString(value.previousName, "Previous invoice name");
+  const previousPeriod = validatePeriod(value.previousPeriod, "Previous invoice period");
+  const previousRevision = safeInteger(value.previousRevision, "Previous invoice revision", 0);
+  const previousUpdatedAt = canonicalTimestamp(
+    value.previousUpdatedAt,
+    "Previous invoice timestamp"
+  );
+  const nextName = requiredString(value.nextName, "Next invoice name");
+  const nextPeriod = validatePeriod(value.nextPeriod, "Next invoice period");
+  const nextRevision = safeInteger(value.nextRevision, "Next invoice revision", 0);
+  const nextUpdatedAt = canonicalTimestamp(value.nextUpdatedAt, "Next invoice timestamp");
+  if (
+    previousName !== invoiceFolderName(previousPeriod) ||
+    nextName !== invoiceFolderName(nextPeriod) ||
+    previousName === nextName ||
+    nextRevision !== previousRevision + 1
+  ) {
+    throw new InvoiceValidationError("Invoice period update marker is inconsistent");
+  }
+  return {
+    schemaVersion: INVOICE_PERIOD_UPDATE_SCHEMA_VERSION,
+    invoiceId,
+    previousName,
+    previousPeriod,
+    previousRevision,
+    previousUpdatedAt,
+    nextName,
+    nextPeriod,
+    nextRevision,
+    nextUpdatedAt,
+  };
+}
+
 function validateRemoveInvoiceOptions(value: unknown): Required<RemoveInvoiceOptions> {
   if (!isRecord(value)) {
     throw new InvoiceValidationError("Invoice removal options must be an object");
@@ -180,6 +242,7 @@ function deletionWarning(): string {
 
 export class InvoiceStore {
   private readonly invoiceOperations = new KeyedSerialQueue<string>();
+  private readonly invoicePeriodOperations = new KeyedSerialQueue<"period-update">();
   private readonly aliasesByBase = new Map<string, Map<string, string>>();
   private admissionTail: Promise<void> = Promise.resolve();
   private readonly now: () => Date;
@@ -317,6 +380,38 @@ export class InvoiceStore {
     });
   }
 
+  /**
+   * Hold alias admission until a folder-moving operation finishes. Without
+   * this barrier, a later request could resolve the old cached folder while a
+   * period update is waiting in that folder's queue.
+   */
+  private enqueueExclusiveFolderOperation<T>(
+    resolveFolder: () => Promise<string>,
+    operation: (folder: string) => Promise<T>
+  ): Promise<T> {
+    let result: T | undefined;
+    let completed = false;
+    const admission = this.admissionTail
+      .catch(() => undefined)
+      .then(async () => {
+        const folder = await resolveFolder();
+        result = await this.invoiceOperations.run(this.invoiceQueueKey(folder), () =>
+          operation(folder)
+        );
+        completed = true;
+      });
+    this.admissionTail = admission.then(
+      () => undefined,
+      () => undefined
+    );
+    return admission.then(() => {
+      if (!completed) {
+        throw new Error("Invoice folder operation did not complete");
+      }
+      return result as T;
+    });
+  }
+
   private async readDeletionSentinel(folder: string): Promise<InvoiceDeletionSentinel | null> {
     const filename = path.join(folder, "DELETED.json");
     let metadata: Awaited<ReturnType<typeof fs.lstat>>;
@@ -350,7 +445,131 @@ export class InvoiceStore {
     return deletion;
   }
 
-  private async readInvoiceFile(folder: string): Promise<InvoiceDocument> {
+  private async readInvoicePeriodUpdateMarker(
+    folder: string
+  ): Promise<InvoicePeriodUpdateMarker | null> {
+    const filename = path.join(folder, INVOICE_PERIOD_UPDATE_FILENAME);
+    let metadata: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      metadata = await fs.lstat(filename);
+    } catch (error) {
+      if (isErrno(error, "ENOENT")) return null;
+      throw error;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new InvoiceValidationError(
+        `${INVOICE_PERIOD_UPDATE_FILENAME} must be an ordinary file`
+      );
+    }
+    try {
+      return validateInvoicePeriodUpdateMarker(JSON.parse(await fs.readFile(filename, "utf8")));
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new InvoiceValidationError(
+          `Invalid JSON in ${INVOICE_PERIOD_UPDATE_FILENAME}: ${error.message}`
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async removeInvoicePeriodUpdateMarker(folder: string): Promise<void> {
+    await fs.rm(path.join(folder, INVOICE_PERIOD_UPDATE_FILENAME), { force: true });
+    await syncDirectory(folder).catch(() => undefined);
+  }
+
+  private invoiceMatchesPeriodUpdateState(
+    invoice: InvoiceDocument,
+    marker: InvoicePeriodUpdateMarker,
+    state: "previous" | "next"
+  ): boolean {
+    const period = state === "previous" ? marker.previousPeriod : marker.nextPeriod;
+    return (
+      invoice.id === marker.invoiceId &&
+      invoice.name === (state === "previous" ? marker.previousName : marker.nextName) &&
+      invoice.period.startDate === period.startDate &&
+      invoice.period.endDate === period.endDate &&
+      invoice.revision === (state === "previous" ? marker.previousRevision : marker.nextRevision) &&
+      invoice.updatedAt === (state === "previous" ? marker.previousUpdatedAt : marker.nextUpdatedAt)
+    );
+  }
+
+  private async writePeriodUpdateBackup(
+    folder: string,
+    invoice: InvoiceDocument,
+    marker: InvoicePeriodUpdateMarker
+  ): Promise<void> {
+    const backup = validateInvoiceDocument({
+      ...cloneInvoiceDocument(invoice),
+      name: marker.nextName,
+      period: marker.nextPeriod,
+      revision: marker.previousRevision,
+      updatedAt: marker.previousUpdatedAt,
+    });
+    const result = await atomicWriteFile(
+      path.join(folder, "invoice.json.bak"),
+      serializeInvoiceDocument(backup),
+      { mode: 0o600 }
+    );
+    if (!result.directorySynced) {
+      throw new Error("Could not durably repair the invoice period backup");
+    }
+  }
+
+  private async recoverInvoicePeriodUpdate(
+    folder: string,
+    invoice: InvoiceDocument
+  ): Promise<InvoiceDocument> {
+    const marker = await this.readInvoicePeriodUpdateMarker(folder);
+    if (!marker) return invoice;
+
+    const folderName = path.basename(folder);
+    if (
+      folderName === marker.previousName &&
+      this.invoiceMatchesPeriodUpdateState(invoice, marker, "previous")
+    ) {
+      // The app stopped after preparing the marker but before moving the
+      // folder. The old invoice remains authoritative, so abandon the change.
+      await this.removeInvoicePeriodUpdateMarker(folder);
+      return invoice;
+    }
+
+    if (folderName !== marker.nextName) {
+      throw new InvoiceValidationError(
+        "Invoice period update marker does not match its containing folder"
+      );
+    }
+
+    let recovered = invoice;
+    if (this.invoiceMatchesPeriodUpdateState(invoice, marker, "previous")) {
+      // The folder move committed but invoice.json did not. Finish the exact
+      // revision recorded by the durable marker.
+      recovered = validateInvoiceDocument({
+        ...cloneInvoiceDocument(invoice),
+        name: marker.nextName,
+        period: marker.nextPeriod,
+        revision: marker.nextRevision,
+        updatedAt: marker.nextUpdatedAt,
+      });
+      await this.writeInvoice(folder, recovered);
+    } else if (!this.invoiceMatchesPeriodUpdateState(invoice, marker, "next")) {
+      throw new InvoiceValidationError(
+        "Invoice state does not match its pending period update marker"
+      );
+    }
+
+    await this.writePeriodUpdateBackup(folder, recovered, marker);
+    await this.removeInvoicePeriodUpdateMarker(folder);
+    return recovered;
+  }
+
+  private readInvoiceFile(folder: string): Promise<InvoiceDocument> {
+    return this.invoicePeriodOperations.run("period-update", () =>
+      this.readInvoiceFileWithPeriodRecovery(folder)
+    );
+  }
+
+  private async readInvoiceFileWithPeriodRecovery(folder: string): Promise<InvoiceDocument> {
     const deletion = await this.readDeletionSentinel(folder);
     if (deletion) {
       throw new InvoiceDeletedError(deletion);
@@ -369,7 +588,7 @@ export class InvoiceStore {
       }
       throw error;
     }
-    const invoice = validateInvoiceDocument(parsed);
+    const invoice = await this.recoverInvoicePeriodUpdate(folder, validateInvoiceDocument(parsed));
     const folderName = path.basename(folder);
     if (invoice.name !== folderName || invoice.name !== invoiceFolderName(invoice.period)) {
       throw new InvoiceValidationError(`Invoice name and period do not match folder ${folderName}`);
@@ -803,66 +1022,71 @@ export class InvoiceStore {
     const base = await this.baseFolder();
     const folder = path.join(base, name);
 
-    return this.invoiceOperations.run(this.invoiceQueueKey(folder), async () => {
-      if (await fileExists(folder)) {
-        await ensureOrdinaryDirectory(folder, "Invoice folder");
-        const deletion = await this.readDeletionSentinel(folder);
-        if (deletion) {
-          throw new InvoiceDeletedError(deletion);
+    return this.enqueueExclusiveFolderOperation(
+      async () => folder,
+      async () => {
+        if (await fileExists(folder)) {
+          await ensureOrdinaryDirectory(folder, "Invoice folder");
+          const deletion = await this.readDeletionSentinel(folder);
+          if (deletion) {
+            throw new InvoiceDeletedError(deletion);
+          }
         }
-      }
-      const invoiceFilename = path.join(folder, "invoice.json");
-      if (await fileExists(invoiceFilename)) {
-        const existing = await this.readInvoiceFile(folder);
-        if (
-          existing.name !== name ||
-          existing.period.startDate !== period.startDate ||
-          existing.period.endDate !== period.endDate
-        ) {
-          throw new InvoiceValidationError(`Existing ${name} contains a different invoice period`);
+        const invoiceFilename = path.join(folder, "invoice.json");
+        if (await fileExists(invoiceFilename)) {
+          const existing = await this.readInvoiceFile(folder);
+          if (
+            existing.name !== name ||
+            existing.period.startDate !== period.startDate ||
+            existing.period.endDate !== period.endDate
+          ) {
+            throw new InvoiceValidationError(
+              `Existing ${name} contains a different invoice period`
+            );
+          }
+          await this.ensureInvoiceDirectories(folder);
+          await this.writeViewsWithState(folder, existing);
+          this.cacheInvoice(base, folder, existing);
+          return cloneInvoiceDocument(existing);
         }
+
+        if (await fileExists(folder)) {
+          const contents = await fs.readdir(folder);
+          if (contents.length > 0) {
+            throw new InvoiceValidationError(
+              `Cannot create ${name}: the folder exists without invoice.json`
+            );
+          }
+        }
+
+        const configuredRate =
+          defaultRateMinor ??
+          (this.options.getDefaultRateMinor ? await this.options.getDefaultRateMinor() : 4500);
+        safeInteger(configuredRate, "Default rate", 0);
+        const timestamp = this.now().toISOString();
+        const invoice: InvoiceDocument = {
+          schemaVersion: INVOICE_SCHEMA_VERSION,
+          id: this.idFactory(),
+          name,
+          period,
+          defaultRateMinor: configuredRate,
+          currency: "USD",
+          revision: 0,
+          rows: [],
+          receipts: [],
+          reviewAcknowledgements: [],
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        const validated = validateInvoiceDocument(invoice);
+
+        await fs.mkdir(folder, { recursive: true });
         await this.ensureInvoiceDirectories(folder);
-        await this.writeViewsWithState(folder, existing);
-        this.cacheInvoice(base, folder, existing);
-        return cloneInvoiceDocument(existing);
+        await this.writeInvoice(folder, validated);
+        this.cacheInvoice(base, folder, validated);
+        return cloneInvoiceDocument(validated);
       }
-
-      if (await fileExists(folder)) {
-        const contents = await fs.readdir(folder);
-        if (contents.length > 0) {
-          throw new InvoiceValidationError(
-            `Cannot create ${name}: the folder exists without invoice.json`
-          );
-        }
-      }
-
-      const configuredRate =
-        defaultRateMinor ??
-        (this.options.getDefaultRateMinor ? await this.options.getDefaultRateMinor() : 4500);
-      safeInteger(configuredRate, "Default rate", 0);
-      const timestamp = this.now().toISOString();
-      const invoice: InvoiceDocument = {
-        schemaVersion: INVOICE_SCHEMA_VERSION,
-        id: this.idFactory(),
-        name,
-        period,
-        defaultRateMinor: configuredRate,
-        currency: "USD",
-        revision: 0,
-        rows: [],
-        receipts: [],
-        reviewAcknowledgements: [],
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      };
-      const validated = validateInvoiceDocument(invoice);
-
-      await fs.mkdir(folder, { recursive: true });
-      await this.ensureInvoiceDirectories(folder);
-      await this.writeInvoice(folder, validated);
-      this.cacheInvoice(base, folder, validated);
-      return cloneInvoiceDocument(validated);
-    });
+    );
   }
 
   async loadInvoice(invoiceId: string): Promise<InvoiceDocument> {
@@ -872,6 +1096,125 @@ export class InvoiceStore {
       this.cacheInvoice(path.dirname(folder), folder, current);
       return cloneInvoiceDocument(current);
     });
+  }
+
+  async updateInvoicePeriod(
+    invoiceId: string,
+    periodValue: InvoicePeriod,
+    expectedRevision: number
+  ): Promise<InvoiceDocument> {
+    const period = validatePeriod(periodValue);
+    safeInteger(expectedRevision, "Expected revision", 0);
+
+    return this.enqueueExclusiveFolderOperation(
+      async () => (await this.findInvoice(invoiceId)).folder,
+      async (folder) =>
+        this.invoicePeriodOperations.run("period-update", async () => {
+          const current = await this.readInvoiceFileWithPeriodRecovery(folder);
+          if (current.revision !== expectedRevision) {
+            throw new RevisionConflictError(current.id, expectedRevision, current.revision);
+          }
+          if (
+            current.period.startDate === period.startDate &&
+            current.period.endDate === period.endDate
+          ) {
+            return cloneInvoiceDocument(current);
+          }
+
+          const base = await this.baseFolder();
+          const resolvedFolder = path.resolve(folder);
+          if (path.dirname(resolvedFolder) !== base) {
+            throw new InvoiceValidationError(
+              "Refusing to rename an invoice outside the configured base folder"
+            );
+          }
+          const metadata = await fs.lstat(resolvedFolder);
+          if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+            throw new InvoiceValidationError("Invoice period updates require an ordinary folder");
+          }
+
+          const name = invoiceFolderName(period);
+          const destination = path.join(base, name);
+          if (await fileExists(destination)) {
+            throw new InvoiceValidationError(
+              `Cannot change the invoice period because ${name} already exists`
+            );
+          }
+
+          const candidate = validateInvoiceDocument({
+            ...cloneInvoiceDocument(current),
+            name,
+            period,
+            revision: safeInteger(current.revision + 1, "Invoice revision", 0),
+            updatedAt: this.now().toISOString(),
+          });
+          const marker: InvoicePeriodUpdateMarker = {
+            schemaVersion: INVOICE_PERIOD_UPDATE_SCHEMA_VERSION,
+            invoiceId: current.id,
+            previousName: current.name,
+            previousPeriod: { ...current.period },
+            previousRevision: current.revision,
+            previousUpdatedAt: current.updatedAt,
+            nextName: candidate.name,
+            nextPeriod: { ...candidate.period },
+            nextRevision: candidate.revision,
+            nextUpdatedAt: candidate.updatedAt,
+          };
+          const markerPath = path.join(resolvedFolder, INVOICE_PERIOD_UPDATE_FILENAME);
+          const markerWrite = await atomicWriteFile(
+            markerPath,
+            `${JSON.stringify(marker, null, 2)}\n`,
+            { mode: 0o600 }
+          );
+          if (!markerWrite.directorySynced) {
+            await fs.rm(markerPath, { force: true }).catch(() => undefined);
+            throw new Error("Could not establish a durable invoice period update marker");
+          }
+
+          try {
+            await fs.rename(resolvedFolder, destination);
+          } catch (error) {
+            await this.removeInvoicePeriodUpdateMarker(resolvedFolder).catch(() => undefined);
+            throw error;
+          }
+          try {
+            await syncDirectory(base);
+            await this.writeInvoice(destination, candidate);
+          } catch (error) {
+            try {
+              await fs.rename(destination, resolvedFolder);
+              await syncDirectory(base).catch(() => undefined);
+              await this.removeInvoicePeriodUpdateMarker(resolvedFolder).catch(() => undefined);
+              await this.writeViewsWithState(resolvedFolder, current).catch(() => undefined);
+              this.cacheInvoice(base, resolvedFolder, current);
+            } catch (rollbackError) {
+              this.evictInvoiceFolder(base, resolvedFolder);
+              this.evictInvoiceFolder(base, destination);
+              throw new AggregateError(
+                [error, rollbackError],
+                "Could not update the invoice period or restore its original folder"
+              );
+            }
+            throw error;
+          }
+
+          let backupReady = false;
+          try {
+            await this.writePeriodUpdateBackup(destination, candidate, marker);
+            backupReady = true;
+          } catch {
+            // invoice.json is already authoritative. Keep the marker so the next
+            // load can repair the destination-compatible backup.
+          }
+          if (backupReady) {
+            await this.removeInvoicePeriodUpdateMarker(destination).catch(() => undefined);
+          }
+
+          this.evictInvoiceFolder(base, resolvedFolder);
+          this.cacheInvoice(base, destination, candidate);
+          return cloneInvoiceDocument(candidate);
+        })
+    );
   }
 
   async removeInvoice(

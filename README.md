@@ -38,11 +38,12 @@ Run `make help` at any time to see every supported command.
 
 ## First launch
 
-1. Choose a working folder. A locally available Dropbox folder is fine.
+1. Choose an invoice state folder. A locally available Dropbox folder is fine.
 2. Open **Settings**.
 3. Paste an OpenAI API key, click **Test Key**, and then **Save Key**.
 4. Optionally change the default hourly rate.
-5. Create an invoice and choose its inclusive start and end dates.
+5. Create an invoice and choose its inclusive start and end dates. Use **Edit dates** in the
+   invoice header if the billing period needs to change later.
 6. Drop one or many receipt images/PDFs into the window, or click **Add Receipts** and select a batch with Command- or Shift-click. The app explains that automatic extraction uploads those receipt files to OpenAI before the first scan.
 7. The files are copied locally first, then scanned in the background. You can cancel the scan or work in another invoice while it runs; the invoice being scanned stays read-only until its final results are loaded.
 8. Review the scanned rows, edit any cells, and add hours as needed. Rows start in ascending Date order; click any user-column header to sort by that column.
@@ -82,7 +83,12 @@ The saved API key is encrypted with Electron `safeStorage` before its ciphertext
 - Copies originals into the invoice and detects exact duplicates using SHA-256.
 - Makes an accepted batch durable in one local update, then scans up to two receipts concurrently in the background with visible progress and cancellation.
 - Extracts the merchant, transaction date, final total, and optional line items.
+- Renames successfully scanned managed receipts to sortable names such as
+  `2026-01-12-whole-foods-market-001.jpg`; additional receipts from the same merchant and date use
+  `002`, `003`, and so on.
 - Provides an editable six-column grid: Date, Groceries MP, Hours Worked, Rate, Labour Total, and Comment.
+- Combines a compatible same-date work row with its sole receipt row. If another receipt later
+  lands on that date, it restores one work row so the date has N receipt rows plus one work row.
 - Sorts all six user columns from their headers, with stable blanks-last ordering and ascending Date as the default.
 - Calculates groceries, hours, labour, and combined invoice totals exactly.
 - Keeps the component `Total` row and adds a final `Grand Total` row whose combined groceries-plus-labour amount appears in the `Labour Total` column.
@@ -113,7 +119,7 @@ Sorting changes the invoice's saved row order rather than creating a temporary s
 
 ## Local data layout
 
-The selected working folder is the database. Each invoice looks like this:
+The selected invoice state folder is the database. Each invoice looks like this:
 
 ~~~text
 invoice-2026-01-01-2026-01-31/
@@ -134,17 +140,32 @@ invoice-2026-01-01-2026-01-31/
 - `invoice.json` is the authoritative editable state.
 - `invoice.tsv` and `invoice.csv` are regenerated views for spreadsheets.
 - `.invoice-views.json` records which authoritative revision produced the views, so stale or interrupted derived files can be repaired without rewriting them whenever an invoice opens.
-- `receipts/` contains managed copies of the source receipts.
+- `receipts/` contains managed copies of the source receipts. A successful scan with a date and
+  merchant uses `YYYY-MM-DD-merchant-NNN.ext`; a scan without either field retains its safe
+  provisional hash-based name.
 - `debug/` contains normalized extraction and optional itemization data.
 - `.trash/` supports safe row/receipt deletion and undo.
-- `output/invoice.pdf` is the client-facing invoice, and `output/receipts/` contains one copy for each unique receipt SHA-256 referenced by the invoice.
+- `output/invoice.pdf` is the client-facing invoice, and `output/receipts/` contains one copy for
+  each unique receipt SHA-256 referenced by the invoice. Receipt copies use the linked row's date
+  and comment, such as `2026-01-01-wf-0.pdf`; matching date/comment pairs increment to `-1`, `-2`,
+  and so on.
+- `output/invoice-YYYY-MM-DD-YYYY-MM-DD.zip` contains the same `invoice.pdf` and `receipts/`
+  package for sending as one compressed file. The unpacked PDF and receipts remain beside it.
 - `invoice.json.bak` retains the previous valid invoice state.
 - `DELETED.json` is a portable deletion sentinel. When present, the app omits that invoice from the
   sidebar and will not silently reopen or recreate it.
 
 Building the client output reconstructs the complete `output/` directory and replaces the previous version only after the new build succeeds. Receipts removed from the invoice therefore cannot linger as stale client attachments. Editing, importing, rescanning, deleting, or restoring invoice data clears the in-app ready state; click **Build PDF Output** again before sending. If a rebuild fails, the previous output remains intact. The build reads the invoice's managed receipt copies; original files selected from Dropbox or elsewhere are never changed, moved, or deleted.
 
-Moving or backing up the complete working folder preserves the invoices. Dropbox may sync it like any other local folder, but the app does not connect to Dropbox itself.
+You can switch the invoice state path later with **Settings → Invoice state folder → Change…**.
+Changing the setting opens the invoices already present at the selected path; it does not move the
+current folder. To relocate the database, move or copy the complete folder first, then select its new
+location in Settings. Moving or backing up the complete folder preserves the invoices. Dropbox may
+sync it like any other local folder, but the app does not connect to Dropbox itself.
+
+Changing an invoice's billing period also changes its date-range folder name. The invoice ID and
+all rows, receipts, debug data, and output stay with it; the app refuses a change when the target
+date-range folder already exists.
 
 ### Removing an invoice
 

@@ -47,4 +47,27 @@ describe("invoice UX messaging", () => {
       expect(markup).toContain("sends each receipt image or PDF to OpenAI");
     }
   });
+
+  it("makes the invoice state path visible and changeable", () => {
+    const baseFolder = "/Users/example/Library/CloudStorage/Drive/Receipts and Invoices";
+    const markup = renderToStaticMarkup(
+      createElement(SettingsModal, {
+        settings: {
+          baseFolder,
+          hasOpenAiKey: false,
+          defaultRateMinor: 4_500,
+        },
+        onClose: vi.fn(),
+        onSettingsChange: vi.fn(),
+        onChooseFolder: vi.fn(),
+      })
+    );
+
+    expect(markup).toContain(`title="${baseFolder}"`);
+    expect(markup).toContain("Invoice state folder");
+    expect(markup).toContain("does not move files from the current folder");
+    expect(markup).toContain("Show full path");
+    expect(markup).toContain("Change…");
+    expect(markup).toContain('aria-expanded="false"');
+  });
 });

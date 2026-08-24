@@ -8,6 +8,7 @@ export const IPC = {
   invoicesList: "invoices:list",
   invoicesCreate: "invoices:create",
   invoicesLoad: "invoices:load",
+  invoicesUpdatePeriod: "invoices:update-period",
   invoicesRemove: "invoices:remove",
   invoicesCheck: "invoices:check",
   invoicesSetReviewAcknowledgement: "invoices:set-review-acknowledgement",

@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { BrowserWindow, shell } from "electron";
 
 import {
@@ -10,12 +12,14 @@ import {
   formatMinorUnits,
   normalizeHours,
 } from "../shared/finance";
+import { INVOICE_PAYMENT_NOTE } from "../shared/tabular";
 import type { InvoiceDocument, InvoiceOutputResult, ReceiptRecord } from "../shared/types";
 import { mapBounded } from "./bounded-operations";
 import type { InvoiceStore } from "./invoice-store";
-import { resolveInside, sha256File } from "./receipt-files";
+import { resolveInside, sanitizeFilenameSegment, sha256File } from "./receipt-files";
 import { KeyedSerialQueue } from "./serial-queue";
 
+const execFileAsync = promisify(execFile);
 type OutputStore = Pick<InvoiceStore, "loadInvoice" | "getInvoiceFolder" | "runAtRevision">;
 
 export type InvoicePdfRenderer = (html: string) => Promise<Buffer>;
@@ -30,6 +34,10 @@ interface VerifiedReceipt {
   receipt: ReceiptRecord;
   sha256: string;
   sourcePath: string;
+}
+
+interface NamedVerifiedReceipt extends VerifiedReceipt {
+  outputFilename: string;
 }
 
 const VALID_SHA256 = /^[0-9a-f]{64}$/;
@@ -56,6 +64,7 @@ export class InvoiceOutputBuilder {
       const invoiceFolder = await this.invoices.getInvoiceFolder(invoice.name);
       const verified = await verifyManagedReceipts(invoice, invoiceFolder);
       const winners = firstReceiptForEachHash(verified);
+      const namedReceipts = nameOutputReceipts(invoice, winners);
       const html = buildInvoiceHtml(invoice);
       const pdf = await this.renderPdf(html);
       assertPdf(pdf);
@@ -64,9 +73,13 @@ export class InvoiceOutputBuilder {
       const nonce = this.nonce();
       const stagingPath = path.join(invoiceFolder, `.output.tmp-${nonce}`);
       const backupPath = path.join(invoiceFolder, `.output.backup-${nonce}`);
+      const archiveFilename = `${invoice.name}.zip`;
+      const temporaryArchivePath = path.join(invoiceFolder, `.output-archive.tmp-${nonce}.zip`);
 
       try {
-        await buildStagedOutput(stagingPath, winners, pdf);
+        await buildStagedOutput(stagingPath, namedReceipts, pdf);
+        await createOutputArchive(stagingPath, temporaryArchivePath);
+        await fs.rename(temporaryArchivePath, path.join(stagingPath, archiveFilename));
         await this.invoices.runAtRevision(
           invoice.id,
           invoice.revision,
@@ -78,10 +91,15 @@ export class InvoiceOutputBuilder {
           }
         );
       } finally {
+        await fs.rm(temporaryArchivePath, { force: true }).catch(() => undefined);
         await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
       }
 
-      return { outputPath, receiptCount: winners.length };
+      return {
+        outputPath,
+        archivePath: path.join(outputPath, archiveFilename),
+        receiptCount: winners.length,
+      };
     });
   }
 
@@ -165,7 +183,7 @@ export function buildInvoiceHtml(invoice: InvoiceDocument): string {
     .total-value { font-weight: 800; white-space: nowrap; }
     .total-row.grand-total { color: #ffffff; background: #173f34; }
     .grand-total .total-label { color: #dceae4; }
-    .note { margin: 14px 0 0; color: #71807a; font-size: 8px; text-align: right; }
+    .note { margin: 14px 0 0; color: #52615b; font-size: 9px; font-weight: 700; text-align: right; }
   </style>
 </head>
 <body>
@@ -209,7 +227,7 @@ export function buildInvoiceHtml(invoice: InvoiceDocument): string {
       ${totalRowHtml("Grand total", formatMoney(totals.invoiceMinor), true)}
     </div>
   </section>
-  <p class="note">Grand total includes groceries and labour.</p>
+  <p class="note">Payment note: ${escapeHtml(INVOICE_PAYMENT_NOTE)}</p>
 </body>
 </html>`;
 }
@@ -291,9 +309,36 @@ function firstReceiptForEachHash(receipts: VerifiedReceipt[]): VerifiedReceipt[]
   });
 }
 
+function nameOutputReceipts(
+  invoice: InvoiceDocument,
+  receipts: VerifiedReceipt[]
+): NamedVerifiedReceipt[] {
+  const rowByReceiptId = new Map<string, InvoiceDocument["rows"][number]>();
+  for (const row of invoice.rows) {
+    if (row.receiptId && !rowByReceiptId.has(row.receiptId)) {
+      rowByReceiptId.set(row.receiptId, row);
+    }
+  }
+
+  const nextIndexByStem = new Map<string, number>();
+  return receipts.map((receipt) => {
+    const row = rowByReceiptId.get(receipt.receipt.id);
+    const date = row?.date && /^\d{4}-\d{2}-\d{2}$/.test(row.date) ? row.date : "undated";
+    const comment = sanitizeFilenameSegment(row?.comment ?? "") || "receipt";
+    const stem = `${date}-${comment}`;
+    const index = nextIndexByStem.get(stem) ?? 0;
+    nextIndexByStem.set(stem, index + 1);
+    const extension = path.extname(receipt.sourcePath).toLowerCase();
+    return {
+      ...receipt,
+      outputFilename: `${stem}-${index}${extension}`,
+    };
+  });
+}
+
 async function buildStagedOutput(
   stagingPath: string,
-  receipts: VerifiedReceipt[],
+  receipts: NamedVerifiedReceipt[],
   pdf: Buffer
 ): Promise<void> {
   await fs.mkdir(stagingPath, { recursive: false, mode: 0o700 });
@@ -304,12 +349,8 @@ async function buildStagedOutput(
     mode: 0o600,
   });
 
-  const usedNames = new Set<string>();
   const copies = receipts.map((receipt) => ({
-    destination: path.join(
-      receiptFolder,
-      availableReceiptName(path.basename(receipt.receipt.relativePath), receipt.sha256, usedNames)
-    ),
+    destination: path.join(receiptFolder, receipt.outputFilename),
     receipt,
   }));
   await mapBounded(copies, OUTPUT_FILE_CONCURRENCY, async ({ destination, receipt }) => {
@@ -324,6 +365,25 @@ async function buildStagedOutput(
       );
     }
   });
+}
+
+async function createOutputArchive(sourceFolder: string, destination: string): Promise<void> {
+  await execFileAsync("/usr/bin/ditto", [
+    "-c",
+    "-k",
+    "--norsrc",
+    "--noextattr",
+    "--noqtn",
+    "--noacl",
+    "--zlibCompressionLevel",
+    "9",
+    sourceFolder,
+    destination,
+  ]);
+  const metadata = await fs.lstat(destination);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size === 0) {
+    throw new Error("Could not create the invoice output ZIP archive.");
+  }
 }
 
 async function replaceOutputDirectory(
@@ -362,26 +422,6 @@ async function replaceOutputDirectory(
     // best-effort so a cleanup-only failure cannot report a failed build after
     // the caller-visible output has already changed.
     await fs.rm(backupPath, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
-
-function availableReceiptName(preferred: string, sha256: string, usedNames: Set<string>): string {
-  const normalizedPreferred = preferred.toLowerCase();
-  if (!usedNames.has(normalizedPreferred)) {
-    usedNames.add(normalizedPreferred);
-    return preferred;
-  }
-
-  const extension = path.extname(preferred);
-  const stem = path.basename(preferred, extension) || "receipt";
-  const base = `${stem}-${sha256.slice(0, 12)}`;
-  for (let suffix = 1; ; suffix += 1) {
-    const candidate = `${base}${suffix === 1 ? "" : `-${suffix}`}${extension}`;
-    const normalized = candidate.toLowerCase();
-    if (!usedNames.has(normalized)) {
-      usedNames.add(normalized);
-      return candidate;
-    }
   }
 }
 

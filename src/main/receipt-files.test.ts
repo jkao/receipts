@@ -7,6 +7,7 @@ import {
   mimeTypeForPath,
   resolveInside,
   sha256File,
+  sortableReceiptFilename,
   writeJsonAtomic,
 } from "./receipt-files";
 
@@ -31,6 +32,28 @@ describe("receipt file helpers", () => {
     expect(managedReceiptFilename("/tmp/Whole Foods #42.JPG", "abcdef0123456789")).toBe(
       "r_abcdef012345__whole-foods-42.jpg"
     );
+  });
+
+  it("creates date-first merchant filenames with lexically sortable sequences", () => {
+    expect(
+      sortableReceiptFilename(
+        "/tmp/camera upload.PDF",
+        "2026-01-12",
+        "  Whôle Foods #42 / Market  ",
+        1
+      )
+    ).toBe("2026-01-12-whole-foods-42-market-001.pdf");
+    expect(sortableReceiptFilename("receipt.HEIC", "2026-01-12", "Whole Foods", 12)).toBe(
+      "2026-01-12-whole-foods-012.heic"
+    );
+  });
+
+  it("does not invent sortable names without a valid date and merchant", () => {
+    expect(sortableReceiptFilename("receipt.jpg", "2026-02-30", "Whole Foods", 1)).toBeNull();
+    expect(sortableReceiptFilename("receipt.jpg", null, "Whole Foods", 1)).toBeNull();
+    expect(sortableReceiptFilename("receipt.jpg", "2026-01-12", null, 1)).toBeNull();
+    expect(sortableReceiptFilename("receipt.jpg", "2026-01-12", "東京", 1)).toBeNull();
+    expect(sortableReceiptFilename("receipt.jpg", "2026-01-12", "Whole Foods", 0)).toBeNull();
   });
 
   it("hashes and atomically writes files", async () => {

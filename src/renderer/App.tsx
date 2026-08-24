@@ -9,6 +9,7 @@ import {
 } from "react";
 import type { SortColumn } from "react-data-grid";
 import { appErrorCode } from "../shared/app-error";
+import { consolidateInvoiceRows } from "../shared/invoice-row-consolidation";
 import type {
   ImportFilesOptions,
   ImportProgress,
@@ -25,6 +26,7 @@ import { ImportProgressPanel } from "./components/ImportProgressPanel";
 import { InvoiceCheckSummary } from "./components/InvoiceCheckSummary";
 import { InvoiceGrid } from "./components/InvoiceGrid";
 import {
+  EditInvoicePeriodModal,
   ExportModal,
   invoiceRemovalNotification,
   NewInvoiceModal,
@@ -33,19 +35,20 @@ import {
 } from "./components/InvoiceModals";
 import { Onboarding } from "./components/Onboarding";
 import { OutputReadyBanner } from "./components/OutputReadyBanner";
-import { receiptUploadConfirmationMessage } from "./components/ReceiptUploadDisclosure";
 import { ReceiptDrawer } from "./components/ReceiptDrawer";
+import { ReceiptGallery } from "./components/ReceiptGallery";
+import { receiptUploadConfirmationMessage } from "./components/ReceiptUploadDisclosure";
 import { SaveIndicator } from "./components/SaveIndicator";
 import { Sidebar } from "./components/Sidebar";
 import {
-  ToastRegion,
   type ToastAction,
   type ToastMessage,
+  ToastRegion,
   type ToastTone,
 } from "./components/ToastRegion";
-import { type SaveStatus, useInvoiceAutosave } from "./hooks/useInvoiceAutosave";
 import { useImportJobs } from "./hooks/useImportJobs";
-import { useMediaQuery } from "./hooks/useMediaQuery";
+import { type SaveStatus, useInvoiceAutosave } from "./hooks/useInvoiceAutosave";
+import { commitActiveGridEditor } from "./lib/activeGridEditor";
 import {
   calculateTotals,
   formatMoney,
@@ -55,18 +58,16 @@ import {
   newRowId,
   todayIso,
 } from "./lib/format";
-import { commitActiveGridEditor } from "./lib/activeGridEditor";
-import {
-  hasInvoiceCheckAttention,
-  indexInvoiceCheckIssuesByRow,
-  isReviewIssue,
-} from "./lib/invoiceCheck";
 import {
   clearImportRefresh,
   retainImportRefreshForInvoice,
   shouldQueueImportRefresh,
 } from "./lib/importRefreshState";
-import { scheduleIdleTask } from "./lib/scheduleIdleTask";
+import {
+  hasInvoiceCheckAttention,
+  indexInvoiceCheckIssuesByRow,
+  isReviewIssue,
+} from "./lib/invoiceCheck";
 import {
   DEFAULT_INVOICE_SORT,
   normalizeInvoiceSort,
@@ -75,8 +76,10 @@ import {
   sortInvoiceRows,
 } from "./lib/invoiceSort";
 import { startReceiptImportWorkflow } from "./lib/receiptImportWorkflow";
+import { scheduleIdleTask } from "./lib/scheduleIdleTask";
 
 export {
+  EditInvoicePeriodModal,
   ExportModal,
   invoiceRemovalNotification,
   RemoveInvoiceModal,
@@ -103,6 +106,7 @@ type BusyAction =
   | "copy"
   | "create"
   | "delete"
+  | "edit-period"
   | "export"
   | "folder"
   | "import"
@@ -113,6 +117,26 @@ type BusyAction =
   | "review"
   | "undo";
 
+type WorkspaceViewMode = "table" | "gallery";
+
+function defaultManualRowDate(invoice: InvoiceDocument): string {
+  const today = todayIso();
+  return today >= invoice.period.startDate && today <= invoice.period.endDate
+    ? today
+    : invoice.period.endDate;
+}
+
+function isDefaultManualRow(row: InvoiceRow, invoice: InvoiceDocument): boolean {
+  return (
+    row.receiptId === null &&
+    row.date === defaultManualRowDate(invoice) &&
+    row.groceriesMinor === null &&
+    row.hours.trim() === "" &&
+    row.rateMinor === invoice.defaultRateMinor &&
+    row.comment.trim() === ""
+  );
+}
+
 export default function App() {
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [invoices, setInvoices] = useState<InvoiceSummary[]>([]);
@@ -122,12 +146,14 @@ export default function App() {
     normalizeInvoiceSort(DEFAULT_INVOICE_SORT)
   );
   const [selectedRows, setSelectedRows] = useState<ReadonlySet<string>>(new Set());
+  const [workspaceViewMode, setWorkspaceViewMode] = useState<WorkspaceViewMode>("table");
   const [detailRowId, setDetailRowId] = useState<string | null>(null);
   const [focusRowId, setFocusRowId] = useState<string | null>(null);
   const [booting, setBooting] = useState(true);
   const [bootError, setBootError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<BusyAction | null>(null);
   const [newInvoiceOpen, setNewInvoiceOpen] = useState(false);
+  const [editInvoicePeriodOpen, setEditInvoicePeriodOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [removeInvoiceOpen, setRemoveInvoiceOpen] = useState(false);
@@ -151,7 +177,6 @@ export default function App() {
   } | null>(null);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
-  const drawerUsesOverlay = useMediaQuery("(max-width: 1180px)");
   const dragDepthRef = useRef(0);
   const receiptUploadAcknowledgedRef = useRef(false);
   const allowCloseRef = useRef(false);
@@ -159,6 +184,7 @@ export default function App() {
   const saveStatusRef = useRef<SaveStatus>("saved");
   const busyActionRef = useRef<BusyAction | null>(busyAction);
   const currentInvoiceRef = useRef<InvoiceDocument | null>(null);
+  const rowsRef = useRef(rows);
   const gridPanelRef = useRef<HTMLElement | null>(null);
   const openingInvoiceIdRef = useRef<string | null>(null);
   const sortColumnsRef = useRef<readonly SortColumn[]>(sortColumns);
@@ -182,6 +208,7 @@ export default function App() {
   const dismissedCheckKeyRef = useRef<string | null>(null);
   const invoiceCheckResultRef = useRef<InvoiceCheckResult | null>(invoiceCheckResult);
   currentInvoiceRef.current = invoice;
+  rowsRef.current = rows;
   busyActionRef.current = busyAction;
   sortColumnsRef.current = sortColumns;
   invoiceCheckResultRef.current = invoiceCheckResult;
@@ -757,6 +784,69 @@ export default function App() {
     }
   };
 
+  const updateInvoicePeriod = async (period: InvoicePeriod) => {
+    const activeInvoice = currentInvoiceRef.current;
+    if (!activeInvoice || busyActionRef.current) return;
+    if (isInvoiceImportingRef.current(activeInvoice.id)) {
+      throw new Error("Cancel or wait for this invoice's receipt scan before changing its dates.");
+    }
+    if (
+      period.startDate === activeInvoice.period.startDate &&
+      period.endDate === activeInvoice.period.endDate
+    ) {
+      setEditInvoicePeriodOpen(false);
+      return;
+    }
+
+    const invoiceId = activeInvoice.id;
+    busyActionRef.current = "edit-period";
+    setBusyAction("edit-period");
+    try {
+      const savedDocument = await autosave.flush();
+      const documentToUpdate = savedDocument ?? currentInvoiceRef.current;
+      if (!documentToUpdate || documentToUpdate.id !== invoiceId) {
+        throw new Error("The open invoice changed before its dates could be updated.");
+      }
+      const updated = await window.receiptApp.updateInvoicePeriod(
+        invoiceId,
+        period,
+        documentToUpdate.revision
+      );
+      if (updated.id !== invoiceId) {
+        throw new Error("The date update did not match the open invoice.");
+      }
+      adoptInvoice(updated, { preserveSelection: true });
+      setEditInvoicePeriodOpen(false);
+      pushToast("Invoice dates updated.", "success");
+    } catch (error) {
+      const errorMessage = messageFromError(error);
+      const revisionConflict = appErrorCode(error) === "REVISION_CONFLICT";
+      pushToast(
+        `Could not update invoice dates: ${errorMessage}`,
+        "error",
+        revisionConflict
+          ? {
+              label: "Reload",
+              run: () => {
+                if (currentInvoiceRef.current?.id !== invoiceId) return;
+                if (busyActionRef.current) {
+                  pushToast("Wait for the current invoice action to finish.");
+                  return;
+                }
+                void reloadInvoiceFromDisk();
+              },
+            }
+          : undefined
+      );
+      throw error;
+    } finally {
+      if (busyActionRef.current === "edit-period") {
+        busyActionRef.current = null;
+        setBusyAction(null);
+      }
+    }
+  };
+
   const removeActiveInvoice = async (hardDelete: boolean) => {
     const activeInvoice = currentInvoiceRef.current;
     if (!activeInvoice || busyActionRef.current) return;
@@ -841,13 +931,21 @@ export default function App() {
 
   const updateRows = useCallback(
     (nextRows: InvoiceRow[]) => {
-      const activeInvoiceId = currentInvoiceRef.current?.id;
+      const activeInvoice = currentInvoiceRef.current;
+      const activeInvoiceId = activeInvoice?.id;
       if (activeInvoiceId && isInvoiceImportingRef.current(activeInvoiceId)) return;
-      const orderedRows = rowsNeedResort(rows, nextRows, sortColumnsRef.current)
-        ? sortInvoiceRows(nextRows, sortColumnsRef.current)
+      const consolidatedRows = activeInvoice
+        ? consolidateInvoiceRows(nextRows, {
+            defaultRateMinor: activeInvoice.defaultRateMinor,
+            createRowId: newRowId,
+          })
         : nextRows;
+      const orderedRows = rowsNeedResort(rows, consolidatedRows, sortColumnsRef.current)
+        ? sortInvoiceRows(consolidatedRows, sortColumnsRef.current)
+        : consolidatedRows;
       clearInvoiceCheck();
       clearBuiltOutput();
+      rowsRef.current = orderedRows;
       setRows(orderedRows);
       autosave.stage(orderedRows);
       setSelectedRows((current) => {
@@ -874,29 +972,68 @@ export default function App() {
     [rows, updateRows]
   );
 
-  const addManualRow = () => {
-    if (!invoice) return;
-    if (isInvoiceImportingRef.current(invoice.id)) {
+  const appendManualRow = useCallback((): InvoiceRow | null => {
+    const activeInvoice = currentInvoiceRef.current;
+    if (!activeInvoice) return null;
+    if (isInvoiceImportingRef.current(activeInvoice.id)) {
       pushToast("Cancel or wait for this invoice's receipt scan before editing rows.");
-      return;
+      return null;
     }
-    const today = todayIso();
-    const date =
-      today >= invoice.period.startDate && today <= invoice.period.endDate
-        ? today
-        : invoice.period.endDate;
     const row: InvoiceRow = {
       id: newRowId(),
-      date,
+      date: defaultManualRowDate(activeInvoice),
       groceriesMinor: null,
       hours: "",
-      rateMinor: invoice.defaultRateMinor,
+      rateMinor: activeInvoice.defaultRateMinor,
       comment: "",
       receiptId: null,
     };
-    updateRows([...rows, row]);
+    updateRows([...rowsRef.current, row]);
+    return row;
+  }, [pushToast, updateRows]);
+
+  const addManualRow = useCallback(() => {
+    if (currentInvoiceLocked) return;
+    const row = appendManualRow();
+    if (!row) return;
     setFocusRowId(row.id);
-  };
+  }, [appendManualRow, currentInvoiceLocked]);
+
+  const appendTrailingEmptyRow = useCallback(() => {
+    if (currentInvoiceLocked) return null;
+    const activeInvoice = currentInvoiceRef.current;
+    const lastRow = rowsRef.current.at(-1);
+    if (activeInvoice && lastRow && isDefaultManualRow(lastRow, activeInvoice)) {
+      return { ...lastRow };
+    }
+    return appendManualRow();
+  }, [appendManualRow, currentInvoiceLocked]);
+
+  const discardTrailingEmptyRow = useCallback(
+    (rowId: string) => {
+      const nextRows = rowsRef.current.filter((row) => row.id !== rowId);
+      if (nextRows.length !== rowsRef.current.length) updateRows(nextRows);
+    },
+    [updateRows]
+  );
+
+  useEffect(() => {
+    const handleManualRowShortcut = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.repeat ||
+        event.altKey ||
+        !event.shiftKey ||
+        (!event.metaKey && !event.ctrlKey) ||
+        event.key.toLowerCase() !== "m"
+      ) {
+        return;
+      }
+      event.preventDefault();
+      addManualRow();
+    };
+    window.addEventListener("keydown", handleManualRowShortcut);
+    return () => window.removeEventListener("keydown", handleManualRowShortcut);
+  }, [addManualRow]);
 
   const retryableSelectedReceiptIds = useMemo(() => {
     if (!invoice) return [];
@@ -1303,7 +1440,7 @@ export default function App() {
       if (currentInvoiceRef.current?.id !== invoiceId) return;
       setBuiltOutput({ invoiceId, result });
       pushToast(
-        `Output built with ${result.receiptCount} unique receipt file${result.receiptCount === 1 ? "" : "s"}.`,
+        `Output built with the PDF, ZIP archive, and ${result.receiptCount} unique receipt file${result.receiptCount === 1 ? "" : "s"}.`,
         "success"
       );
     } catch (error) {
@@ -1334,8 +1471,11 @@ export default function App() {
     [invoiceCheckResult, rows]
   );
   const selectedReceiptCount = retryableSelectedReceiptIds.length;
-  const detailRow = detailRowId ? (rows.find((row) => row.id === detailRowId) ?? null) : null;
-  const backgroundInert = drawerUsesOverlay && detailRow !== null;
+  const receiptRowCount = rows.filter((row) => row.receiptId !== null).length;
+  const manualRowCount = rows.length - receiptRowCount;
+  const detailRowIndex = detailRowId ? rows.findIndex((row) => row.id === detailRowId) : -1;
+  const detailRow = detailRowIndex >= 0 ? (rows[detailRowIndex] ?? null) : null;
+  const backgroundInert = detailRow !== null;
   const detailReceipt =
     detailRow?.receiptId && invoice
       ? (invoice.receipts.find((receipt) => receipt.id === detailRow.receiptId) ?? null)
@@ -1364,6 +1504,7 @@ export default function App() {
   };
 
   const handleAppMouseDownCapture = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target instanceof Element && event.target.closest('[aria-modal="true"]')) return;
     if (event.target === document.activeElement) return;
     if (commitActiveGridEditor(gridPanelRef.current) !== "invalid") return;
     event.preventDefault();
@@ -1397,7 +1538,7 @@ export default function App() {
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: File drag events are delegated at the application boundary; the file picker remains the keyboard equivalent.
     <div
-      className={`app-shell${backgroundInert ? " app-shell--drawer-overlay" : ""}`}
+      className="app-shell"
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={(event) => {
@@ -1470,7 +1611,18 @@ export default function App() {
               <div className="workspace-title">
                 <p className="eyebrow">Client invoice</p>
                 <h1>{invoice.name}</h1>
-                <span>{formatPeriod(invoice.period.startDate, invoice.period.endDate)}</span>
+                <div className="workspace-period">
+                  <span>{formatPeriod(invoice.period.startDate, invoice.period.endDate)}</span>
+                  <button
+                    aria-label="Edit invoice dates"
+                    className="text-button workspace-period-edit"
+                    disabled={currentInvoiceLocked}
+                    type="button"
+                    onClick={() => setEditInvoicePeriodOpen(true)}
+                  >
+                    Edit dates
+                  </button>
+                </div>
               </div>
               <div className="workspace-summary">
                 <div>
@@ -1503,6 +1655,7 @@ export default function App() {
                 <button
                   className="button button--secondary"
                   disabled={currentInvoiceLocked}
+                  title="Add a manual row (⌘⇧M)"
                   type="button"
                   onClick={addManualRow}
                 >
@@ -1628,40 +1781,104 @@ export default function App() {
             <section ref={gridPanelRef} className="grid-panel" aria-busy={currentInvoiceLocked}>
               <div className="grid-panel-heading">
                 <div>
-                  <h2>Invoice rows</h2>
+                  <h2>{workspaceViewMode === "table" ? "Invoice rows" : "Receipt gallery"}</h2>
                   <span>
-                    {rows.length} {rows.length === 1 ? "row" : "rows"}
+                    {workspaceViewMode === "table" ? (
+                      <>
+                        {rows.length} {rows.length === 1 ? "row" : "rows"}
+                      </>
+                    ) : (
+                      <>
+                        {receiptRowCount} {receiptRowCount === 1 ? "receipt" : "receipts"}
+                        {manualRowCount > 0
+                          ? ` · ${manualRowCount} manual ${manualRowCount === 1 ? "row" : "rows"}`
+                          : ""}
+                      </>
+                    )}
                   </span>
                 </div>
-                <SaveIndicator
-                  error={autosave.saveError}
-                  status={autosave.status}
-                  onReload={() => void reloadInvoiceFromDisk()}
-                  onRetry={autosave.retry}
-                />
+                <div className="grid-panel-heading-actions">
+                  <fieldset className="view-switch">
+                    <legend className="sr-only">Invoice row view</legend>
+                    <button
+                      aria-pressed={workspaceViewMode === "table"}
+                      className="view-switch-button"
+                      title="Edit invoice rows in a table"
+                      type="button"
+                      onClick={() => setWorkspaceViewMode("table")}
+                    >
+                      <span aria-hidden="true" className="view-switch-icon">
+                        ☷
+                      </span>
+                      Table
+                    </button>
+                    <button
+                      aria-pressed={workspaceViewMode === "gallery"}
+                      className="view-switch-button"
+                      title="Audit receipts as visual cards"
+                      type="button"
+                      onClick={() => setWorkspaceViewMode("gallery")}
+                    >
+                      <span aria-hidden="true" className="view-switch-icon">
+                        ▦
+                      </span>
+                      Gallery
+                    </button>
+                  </fieldset>
+                  <SaveIndicator
+                    error={autosave.saveError}
+                    status={autosave.status}
+                    onReload={() => void reloadInvoiceFromDisk()}
+                    onRetry={autosave.retry}
+                  />
+                </div>
               </div>
-              <InvoiceGrid
-                activeRowId={detailRowId}
-                checkIssuesByRow={checkIssuesByRow}
-                disabled={currentInvoiceLocked}
-                focusRowId={focusRowId}
-                receipts={invoice.receipts}
-                rows={rows}
-                selectedRows={selectedRows}
-                sortColumns={sortColumns}
-                totals={totals}
-                onDeleteSelected={() => void deleteSelected()}
-                onFocusRowHandled={() => setFocusRowId(null)}
-                onOpenRow={setDetailRowId}
-                onRowsChange={updateRows}
-                onSelectedRowsChange={setSelectedRows}
-                onSortColumnsChange={handleSortColumnsChange}
-              />
+              {workspaceViewMode === "table" ? (
+                <InvoiceGrid
+                  activeRowId={detailRowId}
+                  checkIssuesByRow={checkIssuesByRow}
+                  disabled={currentInvoiceLocked}
+                  focusRowId={focusRowId}
+                  receipts={invoice.receipts}
+                  rows={rows}
+                  selectedRows={selectedRows}
+                  sortColumns={sortColumns}
+                  totals={totals}
+                  onDeleteSelected={() => void deleteSelected()}
+                  onAppendEmptyRow={appendTrailingEmptyRow}
+                  onDiscardEmptyRow={discardTrailingEmptyRow}
+                  onFocusRowHandled={() => setFocusRowId(null)}
+                  onOpenRow={setDetailRowId}
+                  onRowsChange={updateRows}
+                  onSelectedRowsChange={setSelectedRows}
+                  onSortColumnsChange={handleSortColumnsChange}
+                />
+              ) : (
+                <ReceiptGallery
+                  activeRowId={detailRowId}
+                  checkIssuesByRow={checkIssuesByRow}
+                  disabled={currentInvoiceLocked}
+                  invoiceId={invoice.id}
+                  receipts={invoice.receipts}
+                  resourceGeneration={receiptResourceGenerations.get(invoice.id) ?? 0}
+                  rows={rows}
+                  selectedRows={selectedRows}
+                  onOpenRow={setDetailRowId}
+                  onSelectedRowsChange={setSelectedRows}
+                />
+              )}
               <div className="grid-help-line">
-                <span>
-                  Select a cell and press Enter, or double-click, to edit. Use a Receipt button to
-                  open source and scan details.
-                </span>
+                {workspaceViewMode === "table" ? (
+                  <span>
+                    Select a cell and press Enter, or double-click, to edit. Press ⌘⇧M to add a
+                    manual row. Tab from the final Comment cell to continue onto a new row.
+                  </span>
+                ) : (
+                  <span>
+                    Select cards for batch actions. Open a card to inspect its source and scan
+                    details; switch to Table to edit values.
+                  </span>
+                )}
                 <span>The file picker and drag-and-drop both accept one file or a batch.</span>
               </div>
             </section>
@@ -1677,9 +1894,24 @@ export default function App() {
           reviewDisabled={currentInvoiceLocked}
           reviewIssues={detailReviewIssues}
           row={detailRow}
+          rowCount={rows.length}
+          rowNumber={detailRowIndex + 1}
           updatingFingerprints={updatingReviewFingerprints}
           onClose={() => setDetailRowId(null)}
+          onNextRow={
+            detailRowIndex < rows.length - 1
+              ? () => setDetailRowId(rows[detailRowIndex + 1]?.id ?? null)
+              : undefined
+          }
+          onPreviousRow={
+            detailRowIndex > 0
+              ? () => setDetailRowId(rows[detailRowIndex - 1]?.id ?? null)
+              : undefined
+          }
           onRetry={(receiptId) => void retryReceiptIds([receiptId])}
+          onRowChange={(nextRow) =>
+            updateRows(rows.map((row) => (row.id === nextRow.id ? nextRow : row)))
+          }
           onToggleReview={(fingerprint, acknowledged) =>
             void setReviewAcknowledgement(fingerprint, acknowledged)
           }
@@ -1701,6 +1933,14 @@ export default function App() {
           busy={busyAction === "create"}
           onClose={() => setNewInvoiceOpen(false)}
           onCreate={createInvoice}
+        />
+      ) : null}
+      {editInvoicePeriodOpen && invoice ? (
+        <EditInvoicePeriodModal
+          busy={busyAction === "edit-period"}
+          period={invoice.period}
+          onClose={() => setEditInvoicePeriodOpen(false)}
+          onUpdate={updateInvoicePeriod}
         />
       ) : null}
       {settingsOpen ? (

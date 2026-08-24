@@ -11,6 +11,12 @@ interface NewInvoiceModalProps {
   onCreate: (period: InvoicePeriod) => Promise<void>;
 }
 
+function invoicePeriodError(startDate: string, endDate: string): string | null {
+  if (!startDate || !endDate) return "Choose both a start and end date.";
+  if (startDate > endDate) return "The end date must be on or after the start date.";
+  return null;
+}
+
 export function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProps) {
   const today = todayIso();
   const [startDate, setStartDate] = useState(`${today.slice(0, 8)}01`);
@@ -23,12 +29,9 @@ export function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProp
         className="modal-body"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!startDate || !endDate) {
-            setError("Choose both a start and end date.");
-            return;
-          }
-          if (startDate > endDate) {
-            setError("The end date must be on or after the start date.");
+          const validationError = invoicePeriodError(startDate, endDate);
+          if (validationError) {
+            setError(validationError);
             return;
           }
           setError(null);
@@ -84,6 +87,106 @@ export function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProp
   );
 }
 
+interface EditInvoicePeriodModalProps {
+  busy: boolean;
+  period: InvoicePeriod;
+  onClose: () => void;
+  onUpdate: (period: InvoicePeriod) => Promise<void>;
+}
+
+export function EditInvoicePeriodModal({
+  busy,
+  period,
+  onClose,
+  onUpdate,
+}: EditInvoicePeriodModalProps) {
+  const [startDate, setStartDate] = useState(period.startDate);
+  const [endDate, setEndDate] = useState(period.endDate);
+  const [error, setError] = useState<string | null>(null);
+  const unchanged = startDate === period.startDate && endDate === period.endDate;
+
+  return (
+    <ModalFrame
+      closeDisabled={busy}
+      eyebrow="Invoice period"
+      title="Edit Invoice Dates"
+      onClose={onClose}
+    >
+      <form
+        className="modal-body"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const validationError = invoicePeriodError(startDate, endDate);
+          if (validationError) {
+            setError(validationError);
+            return;
+          }
+          if (unchanged) {
+            onClose();
+            return;
+          }
+          setError(null);
+          void onUpdate({ startDate, endDate }).catch((updateError) => {
+            setError(messageFromError(updateError));
+          });
+        }}
+      >
+        <p className="modal-intro">
+          Change the inclusive billing period for this invoice. Existing rows and receipts stay in
+          place; dates outside the new period will be flagged when the invoice is checked.
+        </p>
+        <div className="date-range-fields">
+          <label>
+            <span>Start date</span>
+            <input
+              data-autofocus
+              disabled={busy}
+              max={endDate || undefined}
+              required
+              type="date"
+              value={startDate}
+              onChange={(event) => {
+                setError(null);
+                setStartDate(event.target.value);
+              }}
+            />
+          </label>
+          <span className="date-range-arrow" aria-hidden="true">
+            →
+          </span>
+          <label>
+            <span>End date</span>
+            <input
+              disabled={busy}
+              min={startDate || undefined}
+              required
+              type="date"
+              value={endDate}
+              onChange={(event) => {
+                setError(null);
+                setEndDate(event.target.value);
+              }}
+            />
+          </label>
+        </div>
+        {error ? (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <footer className="modal-actions">
+          <button className="button button--quiet" disabled={busy} type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="button button--primary" disabled={busy || unchanged} type="submit">
+            {busy ? "Saving…" : "Save Dates"}
+          </button>
+        </footer>
+      </form>
+    </ModalFrame>
+  );
+}
+
 interface SettingsModalProps {
   settings: SettingsView;
   onClose: () => void;
@@ -99,6 +202,8 @@ export function SettingsModal({
 }: SettingsModalProps) {
   const [apiKey, setApiKey] = useState("");
   const [rate, setRate] = useState((settings.defaultRateMinor / 100).toFixed(2));
+  const [fullPathVisible, setFullPathVisible] = useState(false);
+  const folderPathId = useId();
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<{ tone: ToastTone; text: string } | null>(null);
 
@@ -125,29 +230,56 @@ export function SettingsModal({
       <div className="modal-body settings-body">
         <section className="settings-section">
           <div className="settings-section-copy">
-            <h3>Working folder</h3>
-            <p>Invoices, copied receipts, and local app data are kept together here.</p>
+            <h3>Invoice state folder</h3>
+            <p>
+              Invoices, copied receipts, and local app data are kept together here. Changing this
+              path switches the app to the invoices in the selected folder; it does not move files
+              from the current folder.
+            </p>
           </div>
           <div className="folder-setting">
-            <code title={settings.baseFolder ?? undefined}>
+            <code
+              id={folderPathId}
+              className={fullPathVisible ? "folder-path folder-path--expanded" : "folder-path"}
+              title={settings.baseFolder ?? undefined}
+            >
               {settings.baseFolder ?? "No folder selected"}
             </code>
-            <button
-              className="button button--secondary"
-              disabled={busy != null}
-              type="button"
-              onClick={() =>
-                void run("folder", async () => {
-                  const next = await onChooseFolder();
-                  onSettingsChange(next);
-                  if (next.baseFolder !== settings.baseFolder) {
-                    setMessage({ tone: "success", text: "Working folder changed." });
-                  }
-                })
-              }
-            >
-              {busy === "folder" ? "Choosing…" : "Choose…"}
-            </button>
+            <div className="folder-setting-actions">
+              {settings.baseFolder ? (
+                <button
+                  aria-controls={folderPathId}
+                  aria-expanded={fullPathVisible}
+                  className="button button--quiet"
+                  type="button"
+                  onClick={() => setFullPathVisible((visible) => !visible)}
+                >
+                  {fullPathVisible ? "Hide full path" : "Show full path"}
+                </button>
+              ) : null}
+              <button
+                className="button button--secondary"
+                disabled={busy != null}
+                type="button"
+                onClick={() =>
+                  void run("folder", async () => {
+                    const next = await onChooseFolder();
+                    onSettingsChange(next);
+                    if (next.baseFolder !== settings.baseFolder) {
+                      setMessage({ tone: "success", text: "Invoice state folder changed." });
+                    }
+                  })
+                }
+              >
+                {busy === "folder"
+                  ? settings.baseFolder
+                    ? "Changing…"
+                    : "Choosing…"
+                  : settings.baseFolder
+                    ? "Change…"
+                    : "Choose…"}
+              </button>
+            </div>
           </div>
         </section>
 

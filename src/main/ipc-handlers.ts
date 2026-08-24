@@ -51,7 +51,7 @@ export function registerIpcHandlers(deps: Dependencies): void {
   handle(IPC.settingsGet, () => deps.settings.getView());
   handle(IPC.settingsChooseBase, async () => {
     const result = await dialog.showOpenDialog(requiredWindow(deps), {
-      title: "Choose invoice base folder",
+      title: "Choose invoice state folder",
       buttonLabel: "Use this folder",
       properties: ["openDirectory", "createDirectory"],
     });
@@ -77,6 +77,9 @@ export function registerIpcHandlers(deps: Dependencies): void {
     return deps.invoices.createInvoice(period, settings.defaultRateMinor);
   });
   handle(IPC.invoicesLoad, (invoiceId) => deps.invoices.loadInvoice(invoiceId));
+  handle(IPC.invoicesUpdatePeriod, (invoiceId, period, expectedRevision) =>
+    deps.invoices.updateInvoicePeriod(invoiceId, period, expectedRevision)
+  );
   handle(IPC.invoicesRemove, (invoiceId, options) =>
     deps.invoices.removeInvoice(invoiceId, options)
   );

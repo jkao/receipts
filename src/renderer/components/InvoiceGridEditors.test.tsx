@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import type { CalculatedColumn, RenderEditCellProps } from "react-data-grid";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { InvoiceRow } from "../../shared/types";
@@ -237,5 +238,126 @@ describe("InvoiceGrid editors", () => {
 
     expect(screen.getByRole("textbox", { name: "Groceries amount" })).toBe(input);
     expect(input.getAttribute("aria-invalid")).toBe("true");
+  });
+
+  it("creates a provisional row from Tab in the final Comment cell and removes it if blank", async () => {
+    exposeAllGridColumns();
+    const user = userEvent.setup();
+
+    function GridHarness() {
+      const [rows, setRows] = useState([row]);
+      return (
+        <>
+          <output data-testid="row-count">{rows.length}</output>
+          <button type="button">Outside grid</button>
+          <InvoiceGrid
+            activeRowId={null}
+            receipts={[]}
+            rows={rows}
+            selectedRows={new Set()}
+            sortColumns={[]}
+            totals={{
+              groceriesMinor: 500,
+              hours: "1.00",
+              labourMinor: 4_500,
+              invoiceMinor: 5_000,
+            }}
+            onAppendEmptyRow={() => {
+              const emptyRow: InvoiceRow = {
+                id: "row-provisional",
+                date: "2026-08-23",
+                groceriesMinor: null,
+                hours: "",
+                rateMinor: 4_500,
+                comment: "",
+                receiptId: null,
+              };
+              setRows((current) => [...current, emptyRow]);
+              return emptyRow;
+            }}
+            onDeleteSelected={vi.fn()}
+            onDiscardEmptyRow={(rowId) =>
+              setRows((current) => current.filter((candidate) => candidate.id !== rowId))
+            }
+            onOpenRow={vi.fn()}
+            onRowsChange={setRows}
+            onSelectedRowsChange={vi.fn()}
+            onSortColumnsChange={vi.fn()}
+          />
+        </>
+      );
+    }
+
+    render(<GridHarness />);
+    await user.dblClick(screen.getByText("Original"));
+    await user.keyboard("{Tab}");
+
+    await waitFor(() => expect(screen.getByTestId("row-count").textContent).toBe("2"));
+    expect(screen.getByLabelText("Receipt date")).toBeTruthy();
+
+    const outside = screen.getByRole("button", { name: "Outside grid" });
+    await user.click(outside);
+    outside.focus();
+    await waitFor(() => expect(screen.getByTestId("row-count").textContent).toBe("1"));
+  });
+
+  it("keeps a Tab-created row after the user enters data", async () => {
+    exposeAllGridColumns();
+    const user = userEvent.setup();
+
+    function GridHarness() {
+      const [rows, setRows] = useState([row]);
+      return (
+        <>
+          <output data-testid="row-count">{rows.length}</output>
+          <button type="button">Outside grid</button>
+          <InvoiceGrid
+            activeRowId={null}
+            receipts={[]}
+            rows={rows}
+            selectedRows={new Set()}
+            sortColumns={[]}
+            totals={{
+              groceriesMinor: 500,
+              hours: "1.00",
+              labourMinor: 4_500,
+              invoiceMinor: 5_000,
+            }}
+            onAppendEmptyRow={() => {
+              const emptyRow: InvoiceRow = {
+                id: "row-provisional",
+                date: "2026-08-23",
+                groceriesMinor: null,
+                hours: "",
+                rateMinor: 4_500,
+                comment: "",
+                receiptId: null,
+              };
+              setRows((current) => [...current, emptyRow]);
+              return emptyRow;
+            }}
+            onDeleteSelected={vi.fn()}
+            onDiscardEmptyRow={(rowId) =>
+              setRows((current) => current.filter((candidate) => candidate.id !== rowId))
+            }
+            onOpenRow={vi.fn()}
+            onRowsChange={setRows}
+            onSelectedRowsChange={vi.fn()}
+            onSortColumnsChange={vi.fn()}
+          />
+        </>
+      );
+    }
+
+    render(<GridHarness />);
+    await user.dblClick(screen.getByText("Original"));
+    await user.keyboard("{Tab}");
+    const date = await screen.findByLabelText("Receipt date");
+    fireEvent.change(date, { target: { value: "2026-08-22" } });
+    const outside = screen.getByRole("button", { name: "Outside grid" });
+    await user.click(outside);
+    outside.focus();
+
+    await waitFor(() => expect(screen.getByTestId("row-count").textContent).toBe("2"));
   });
 });

@@ -261,6 +261,7 @@ export interface ExportPackageResult {
 
 export interface InvoiceOutputResult {
   outputPath: string;
+  archivePath: string;
   receiptCount: number;
 }
 
@@ -279,6 +280,11 @@ export interface DesktopApi {
   listInvoices(): Promise<InvoiceSummary[]>;
   createInvoice(period: InvoicePeriod): Promise<InvoiceDocument>;
   loadInvoice(invoiceId: string): Promise<InvoiceDocument>;
+  updateInvoicePeriod(
+    invoiceId: string,
+    period: InvoicePeriod,
+    expectedRevision: number
+  ): Promise<InvoiceDocument>;
   removeInvoice(invoiceId: string, options: RemoveInvoiceOptions): Promise<InvoiceRemovalResult>;
   checkInvoice(invoiceId: string): Promise<InvoiceCheckResult>;
   setReviewAcknowledgement(
@@ -311,6 +317,10 @@ export interface DesktopApi {
   getReceiptPreview(invoiceId: string, receiptId: string): Promise<ReceiptPreview>;
   /** Release the active receipt Blob URL and invalidate any pending preview request. */
   releaseReceiptPreview(): void;
+  /** Load an independently managed preview for a receipt-gallery card. */
+  getReceiptThumbnail(invoiceId: string, receiptId: string): Promise<ReceiptPreview>;
+  /** Release one gallery-card Blob URL and invalidate its pending request. */
+  releaseReceiptThumbnail(invoiceId: string, receiptId: string): void;
   getReceiptDebug(invoiceId: string, receiptId: string): Promise<ReceiptDebug | null>;
   copyTsv(
     invoiceId: string,

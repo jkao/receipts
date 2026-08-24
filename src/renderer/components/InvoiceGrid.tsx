@@ -1,28 +1,29 @@
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
-  DataGrid,
-  Row,
-  SelectColumn,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
   type Column,
+  DataGrid,
   type DataGridHandle,
   type RenderEditCellProps,
   type Renderers,
+  Row,
+  SelectColumn,
   type SortColumn,
 } from "react-data-grid";
+import { normalizeHours } from "../../shared/finance";
 import type {
   InvoiceCheckIssue,
   InvoiceRow,
   InvoiceTotals,
   ReceiptRecord,
 } from "../../shared/types";
-import { normalizeHours } from "../../shared/finance";
-import { invoiceCheckIssueTitle } from "../lib/invoiceCheck";
-import { buildInvoiceSummaryRows, type InvoiceSummaryRow } from "../lib/invoiceSummary";
-import {
-  validateDateEditorInput,
-  validateHoursEditorInput,
-  validateMoneyEditorInput,
-} from "../lib/gridEditorValidation";
 import {
   formatHours,
   formatMoney,
@@ -30,6 +31,13 @@ import {
   labourMinor,
   minorToInput,
 } from "../lib/format";
+import {
+  validateDateEditorInput,
+  validateHoursEditorInput,
+  validateMoneyEditorInput,
+} from "../lib/gridEditorValidation";
+import { invoiceCheckIssueTitle } from "../lib/invoiceCheck";
+import { buildInvoiceSummaryRows, type InvoiceSummaryRow } from "../lib/invoiceSummary";
 
 const EMPTY_CHECK_ISSUES = new Map<string, readonly InvoiceCheckIssue[]>();
 const rowKeyGetter = (row: InvoiceRow) => row.id;
@@ -50,6 +58,8 @@ interface InvoiceGridProps {
   onOpenRow: (rowId: string) => void;
   onFocusRowHandled?: () => void;
   onDeleteSelected: () => void;
+  onAppendEmptyRow?: () => InvoiceRow | null;
+  onDiscardEmptyRow?: (rowId: string) => void;
 }
 
 function stopGridKeys(event: KeyboardEvent<HTMLInputElement>) {
@@ -293,7 +303,10 @@ export function CommentEditor({
   row,
   onRowChange,
   onClose,
-}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow>) {
+  onTabFromLastRow,
+}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow> & {
+  onTabFromLastRow?: () => boolean;
+}) {
   const [value, setValue] = useState(row.comment);
   const committedRef = useRef(false);
 
@@ -321,6 +334,10 @@ export function CommentEditor({
         if (event.key === "Enter" || event.key === "Tab") {
           if (event.key === "Enter") event.preventDefault();
           commit();
+          if (event.key === "Tab" && !event.shiftKey && onTabFromLastRow?.()) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
         }
         if (event.key === "Escape") onClose(false);
       }}
@@ -344,9 +361,17 @@ export function InvoiceGrid({
   onOpenRow,
   onFocusRowHandled,
   onDeleteSelected,
+  onAppendEmptyRow,
+  onDiscardEmptyRow,
 }: InvoiceGridProps) {
   const gridRef = useRef<DataGridHandle>(null);
+  const gridWrapRef = useRef<HTMLDivElement>(null);
   const pendingEditedCellRef = useRef<{ rowId: string; columnIdx: number } | null>(null);
+  const pendingTabRowIdRef = useRef<string | null>(null);
+  const provisionalRowRef = useRef<InvoiceRow | null>(null);
+  const discardTimerRef = useRef<number | null>(null);
+  const latestRowsRef = useRef(rows);
+  latestRowsRef.current = rows;
   const receiptById = useMemo(
     () => new Map(receipts.map((receipt) => [receipt.id, receipt])),
     [receipts]
@@ -382,6 +407,88 @@ export function InvoiceGrid({
     if (rowIdx < 0) return;
     gridRef.current?.setActivePosition({ rowIdx, idx: pending.columnIdx }, { shouldFocus: true });
   }, [disabled, rows]);
+
+  useEffect(() => {
+    const rowId = pendingTabRowIdRef.current;
+    if (!rowId || disabled) return;
+    const rowIdx = rows.findIndex((row) => row.id === rowId);
+    if (rowIdx < 0) return;
+    pendingTabRowIdRef.current = null;
+    gridRef.current?.scrollToCell({ rowIdx, idx: 1 });
+    gridRef.current?.setActivePosition(
+      { rowIdx, idx: 1 },
+      { enableEditor: true, shouldFocus: true }
+    );
+  }, [disabled, rows]);
+
+  useEffect(
+    () => () => {
+      if (discardTimerRef.current !== null) window.clearTimeout(discardTimerRef.current);
+    },
+    []
+  );
+
+  const ensureTrailingEmptyRow = useCallback((): boolean => {
+    if (!onAppendEmptyRow) return false;
+
+    const provisional = provisionalRowRef.current;
+    if (provisional) {
+      const rowIdx = latestRowsRef.current.findIndex((row) => row.id === provisional.id);
+      if (rowIdx >= 0 && isEmptyProvisionalRow(latestRowsRef.current[rowIdx], provisional)) {
+        pendingTabRowIdRef.current = provisional.id;
+        gridRef.current?.setActivePosition(
+          { rowIdx, idx: 1 },
+          { enableEditor: true, shouldFocus: true }
+        );
+        return true;
+      }
+      provisionalRowRef.current = null;
+    }
+
+    const row = onAppendEmptyRow();
+    if (!row) return false;
+    provisionalRowRef.current = row;
+    const existingRowIdx = latestRowsRef.current.findIndex((current) => current.id === row.id);
+    if (existingRowIdx >= 0) {
+      gridRef.current?.setActivePosition(
+        { rowIdx: existingRowIdx, idx: 1 },
+        { enableEditor: true, shouldFocus: true }
+      );
+    } else {
+      pendingTabRowIdRef.current = row.id;
+    }
+    return true;
+  }, [onAppendEmptyRow]);
+
+  const scheduleEmptyRowCleanup = useCallback(() => {
+    if (!provisionalRowRef.current || !onDiscardEmptyRow) return;
+    if (discardTimerRef.current !== null) window.clearTimeout(discardTimerRef.current);
+    discardTimerRef.current = window.setTimeout(() => {
+      discardTimerRef.current = null;
+      const wrapper = gridWrapRef.current;
+      if (wrapper?.contains(document.activeElement)) return;
+      if (wrapper?.querySelector('[aria-invalid="true"]')) return;
+
+      const provisional = provisionalRowRef.current;
+      if (!provisional) return;
+      const current = latestRowsRef.current.find((row) => row.id === provisional.id);
+      provisionalRowRef.current = null;
+      if (current && isEmptyProvisionalRow(current, provisional)) {
+        onDiscardEmptyRow(current.id);
+      }
+    }, 0);
+  }, [onDiscardEmptyRow]);
+
+  useEffect(() => {
+    const handleFocusIn = (event: FocusEvent) => {
+      if (gridWrapRef.current?.contains(event.target as Node)) return;
+      scheduleEmptyRowCleanup();
+    };
+    document.addEventListener("focusin", handleFocusIn);
+    return () => document.removeEventListener("focusin", handleFocusIn);
+  }, [scheduleEmptyRowCleanup]);
+
+  const lastRowId = rows.at(-1)?.id;
 
   const columns = useMemo<Column<InvoiceRow, InvoiceSummaryRow>[]>(
     () => [
@@ -527,18 +634,28 @@ export function InvoiceGrid({
             </span>
           );
         },
-        renderEditCell: CommentEditor,
+        renderEditCell: (props) => (
+          <CommentEditor
+            {...props}
+            onTabFromLastRow={props.row.id === lastRowId ? ensureTrailingEmptyRow : undefined}
+          />
+        ),
         renderSummaryCell: ({ row }) =>
           row.kind === "grand" ? <strong>Groceries + Labour</strong> : null,
       },
     ],
-    [checkIssuesByRow, disabled, onOpenRow, receiptById]
+    [checkIssuesByRow, disabled, ensureTrailingEmptyRow, lastRowId, onOpenRow, receiptById]
   );
 
   return (
     <div
+      ref={gridWrapRef}
       aria-disabled={disabled || undefined}
       className={`invoice-grid-wrap${disabled ? " invoice-grid-wrap--disabled" : ""}`}
+      onBlurCapture={(event) => {
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        scheduleEmptyRowCleanup();
+      }}
     >
       <DataGrid<InvoiceRow, InvoiceSummaryRow, string>
         ref={gridRef}
@@ -557,6 +674,19 @@ export function InvoiceGrid({
         selectedRows={selectedRows}
         summaryRowHeight={46}
         onCellKeyDown={(args, event) => {
+          if (
+            !disabled &&
+            args.mode === "ACTIVE" &&
+            event.key === "Tab" &&
+            !event.shiftKey &&
+            args.rowIdx === rows.length - 1 &&
+            args.column?.key === "comment" &&
+            ensureTrailingEmptyRow()
+          ) {
+            event.preventDefault();
+            event.preventGridDefault();
+            return;
+          }
           if (
             !disabled &&
             args.mode === "ACTIVE" &&
@@ -597,5 +727,16 @@ export function InvoiceGrid({
         }}
       />
     </div>
+  );
+}
+
+function isEmptyProvisionalRow(row: InvoiceRow, defaults: InvoiceRow): boolean {
+  return (
+    row.receiptId === null &&
+    row.date === defaults.date &&
+    row.groceriesMinor === null &&
+    row.hours.trim() === "" &&
+    row.rateMinor === defaults.rateMinor &&
+    row.comment.trim() === ""
   );
 }

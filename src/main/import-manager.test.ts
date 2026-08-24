@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ImportProgress } from "../shared/types";
-import { ImportManager, RECEIPT_SCAN_CONCURRENCY } from "./import-manager";
+import {
+  ImportManager,
+  RECEIPT_RENAME_JOURNAL_FILENAME,
+  RECEIPT_SCAN_CONCURRENCY,
+} from "./import-manager";
 import { InvoiceChecker } from "./invoice-checker";
 import { InvoiceStore } from "./invoice-store";
 import type { OpenAiReceiptResult } from "./openai";
@@ -59,6 +63,9 @@ describe("ImportManager", () => {
     expect(events).toContain("ready");
 
     const folder = await store.getInvoiceFolder(invoice.id);
+    expect(first.invoice.receipts[0].relativePath).toBe(
+      path.join("receipts", "2026-01-12-key-foods-001.jpg")
+    );
     await expect(
       fs.access(path.join(folder, first.invoice.receipts[0].relativePath))
     ).resolves.toBeUndefined();
@@ -71,6 +78,149 @@ describe("ImportManager", () => {
     expect(second.duplicates).toHaveLength(1);
     expect(second.duplicates[0].sameInvoice).toBe(true);
     expect(second.invoice.rows).toHaveLength(1);
+  });
+
+  it("increments same-date merchant names across file types", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-01-01",
+      endDate: "2026-01-31",
+    });
+    const firstSource = path.join(baseFolder, "camera-one.JPG");
+    const secondSource = path.join(baseFolder, "camera-two.PDF");
+    await fs.writeFile(firstSource, "first Whole Foods receipt");
+    await fs.writeFile(secondSource, "second Whole Foods receipt");
+    const extraction = successfulExtraction();
+    extraction.extraction.merchant = " Whôle Foods #12 ";
+    const manager = new ImportManager(
+      store,
+      { getOpenAiKey: async () => "test-key" },
+      () => undefined,
+      () => ({ extract: async () => structuredClone(extraction) })
+    );
+
+    const first = await manager.importFiles(invoice.id, [firstSource]);
+    const second = await manager.importFiles(invoice.id, [secondSource]);
+
+    expect(first.invoice.receipts[0].relativePath).toBe(
+      path.join("receipts", "2026-01-12-whole-foods-12-001.jpg")
+    );
+    expect(second.invoice.receipts.map((receipt) => receipt.relativePath)).toEqual([
+      path.join("receipts", "2026-01-12-whole-foods-12-001.jpg"),
+      path.join("receipts", "2026-01-12-whole-foods-12-002.pdf"),
+    ]);
+    const receiptFolder = path.join(await store.getInvoiceFolder(invoice.id), "receipts");
+    expect((await fs.readdir(receiptFolder)).sort()).toEqual([
+      "2026-01-12-whole-foods-12-001.jpg",
+      "2026-01-12-whole-foods-12-002.pdf",
+    ]);
+  });
+
+  it("keeps the provisional filename when extraction lacks a merchant", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-01-01",
+      endDate: "2026-01-31",
+    });
+    const source = path.join(baseFolder, "merchant-missing.WEBP");
+    await fs.writeFile(source, "receipt without a detected merchant");
+    const extraction = successfulExtraction();
+    extraction.extraction.merchant = null;
+    extraction.validationWarnings = ["Merchant was not found."];
+    const manager = new ImportManager(
+      store,
+      { getOpenAiKey: async () => "test-key" },
+      () => undefined,
+      () => ({ extract: async () => extraction })
+    );
+
+    const result = await manager.importFiles(invoice.id, [source]);
+
+    expect(path.basename(result.invoice.receipts[0].relativePath)).toMatch(
+      /^r_[a-f0-9]{12}__merchant-missing\.webp$/
+    );
+    expect(result.invoice.receipts[0].status).toBe("needs-review");
+  });
+
+  it("rolls a managed filename back when the extraction metadata commit fails", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-01-01",
+      endDate: "2026-01-31",
+    });
+    const source = path.join(baseFolder, "rename-rollback.jpg");
+    await fs.writeFile(source, "rename rollback receipt");
+    const originalMutateInvoice = store.mutateInvoice.bind(store);
+    let mutationCount = 0;
+    vi.spyOn(store, "mutateInvoice").mockImplementation(
+      (targetInvoiceId, mutator, expectedRevision) => {
+        mutationCount += 1;
+        if (mutationCount === 3) {
+          return Promise.reject(new Error("simulated extraction metadata failure"));
+        }
+        return originalMutateInvoice(targetInvoiceId, mutator, expectedRevision);
+      }
+    );
+    const manager = new ImportManager(
+      store,
+      { getOpenAiKey: async () => "test-key" },
+      () => undefined,
+      () => ({ extract: async () => successfulExtraction() })
+    );
+
+    const result = await manager.importFiles(invoice.id, [source]);
+    const provisionalName = path.basename(result.invoice.receipts[0].relativePath);
+    const receiptFolder = path.join(await store.getInvoiceFolder(invoice.id), "receipts");
+
+    expect(result.errors).toEqual([
+      { filename: "rename-rollback.jpg", message: "simulated extraction metadata failure" },
+    ]);
+    expect(result.invoice.receipts[0].status).toBe("error");
+    expect(provisionalName).toMatch(/^r_[a-f0-9]{12}__rename-rollback\.jpg$/);
+    expect(await fs.readdir(receiptFolder)).toEqual([provisionalName]);
+  });
+
+  it("recovers an interrupted sortable copy before retrying the receipt", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-01-01",
+      endDate: "2026-01-31",
+    });
+    const source = path.join(baseFolder, "interrupted-name.jpg");
+    await fs.writeFile(source, "interrupted sortable receipt copy");
+    let apiKey: string | null = null;
+    const manager = new ImportManager(
+      store,
+      { getOpenAiKey: async () => apiKey },
+      () => undefined,
+      () => ({ extract: async () => successfulExtraction() })
+    );
+    const imported = await manager.importFiles(invoice.id, [source]);
+    const receipt = imported.invoice.receipts[0];
+    const invoiceFolder = await store.getInvoiceFolder(invoice.id);
+    const previousPath = path.join(invoiceFolder, receipt.relativePath);
+    const nextRelativePath = path.join("receipts", "2026-01-12-key-foods-001.jpg");
+    const nextPath = path.join(invoiceFolder, nextRelativePath);
+    await fs.copyFile(previousPath, nextPath);
+    await fs.writeFile(
+      path.join(invoiceFolder, RECEIPT_RENAME_JOURNAL_FILENAME),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        invoiceId: invoice.id,
+        receiptId: receipt.id,
+        previousRelativePath: receipt.relativePath,
+        nextRelativePath,
+        sha256: receipt.sha256,
+      })}\n`,
+      "utf8"
+    );
+
+    apiKey = "test-key";
+    const retried = await manager.retryReceipts(invoice.id, [receipt.id]);
+
+    expect(retried.receipts[0]).toMatchObject({ relativePath: nextRelativePath, status: "ready" });
+    expect(await fs.readdir(path.join(invoiceFolder, "receipts"))).toEqual([
+      "2026-01-12-key-foods-001.jpg",
+    ]);
+    await expect(
+      fs.access(path.join(invoiceFolder, RECEIPT_RENAME_JOURNAL_FILENAME))
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("prepares a batch before scanning and deduplicates paths and content in one lookup", async () => {
@@ -126,9 +276,21 @@ describe("ImportManager", () => {
         sameInvoice: true,
       }),
     ]);
-    expect(scanned).toEqual(
-      result.invoice.receipts.map((receipt) => path.basename(receipt.relativePath))
+    expect(scanned).toEqual([
+      expect.stringMatching(/^r_[a-f0-9]{12}__first\.jpg$/),
+      expect.stringMatching(/^r_[a-f0-9]{12}__second\.png$/),
+    ]);
+    const storedFilenames = result.invoice.receipts.map((receipt) =>
+      path.basename(receipt.relativePath)
     );
+    expect(storedFilenames).toEqual([
+      expect.stringMatching(/^2026-01-12-key-foods-\d{3}\.jpg$/),
+      expect.stringMatching(/^2026-01-12-key-foods-\d{3}\.png$/),
+    ]);
+    expect(storedFilenames.map((filename) => filename.match(/-(\d{3})\./)?.[1]).sort()).toEqual([
+      "001",
+      "002",
+    ]);
     expect(batchDurableBeforeFirstScan).toBe(true);
     expect(maximumActiveScans).toBe(RECEIPT_SCAN_CONCURRENCY);
     expect(findHashes).toHaveBeenCalledTimes(1);
@@ -1116,6 +1278,101 @@ describe("ImportManager", () => {
     expect(current.rows).toHaveLength(1);
     expect(current.receipts).toHaveLength(1);
     expect(current.receipts[0].id).toBe(second.invoice.receipts[0].id);
+  });
+
+  it("automatically combines one scanned receipt with one same-date work row", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-01-01",
+      endDate: "2026-01-31",
+    });
+    await store.saveRows(
+      invoice.id,
+      [
+        {
+          id: "row-work",
+          date: "2026-01-12",
+          groceriesMinor: null,
+          hours: "2.75",
+          rateMinor: 5_500,
+          comment: "",
+          receiptId: null,
+        },
+      ],
+      invoice.revision
+    );
+    const source = path.join(baseFolder, "single-same-day.jpg");
+    await fs.writeFile(source, "single same-day receipt");
+    const manager = new ImportManager(
+      store,
+      { getOpenAiKey: async () => "test-key" },
+      () => undefined,
+      () => ({ extract: async () => successfulExtraction() })
+    );
+
+    const imported = await manager.importFiles(invoice.id, [source]);
+
+    expect(imported.invoice.rows).toEqual([
+      expect.objectContaining({
+        date: "2026-01-12",
+        groceriesMinor: 1_073,
+        hours: "2.75",
+        rateMinor: 5_500,
+        comment: "Key Foods",
+        receiptId: imported.invoice.receipts[0].id,
+      }),
+    ]);
+  });
+
+  it("keeps N receipt rows plus one work row when same-date receipts exceed one", async () => {
+    const invoice = await store.createInvoice({
+      startDate: "2026-01-01",
+      endDate: "2026-01-31",
+    });
+    await store.saveRows(
+      invoice.id,
+      [
+        {
+          id: "row-work",
+          date: "2026-01-12",
+          groceriesMinor: null,
+          hours: "4",
+          rateMinor: 6_000,
+          comment: "",
+          receiptId: null,
+        },
+      ],
+      invoice.revision
+    );
+    const first = path.join(baseFolder, "same-day-first.jpg");
+    const second = path.join(baseFolder, "same-day-second.png");
+    await fs.writeFile(first, "same-day first receipt");
+    await fs.writeFile(second, "same-day second receipt");
+    const manager = new ImportManager(
+      store,
+      { getOpenAiKey: async () => "test-key" },
+      () => undefined,
+      () => ({ extract: async () => successfulExtraction() })
+    );
+
+    const imported = await manager.importFiles(invoice.id, [first, second]);
+    const receiptRows = imported.invoice.rows.filter((candidate) => candidate.receiptId !== null);
+    const workRows = imported.invoice.rows.filter((candidate) => candidate.receiptId === null);
+
+    expect(imported.invoice.rows).toHaveLength(3);
+    expect(receiptRows).toHaveLength(2);
+    expect(receiptRows).toEqual([
+      expect.objectContaining({ date: "2026-01-12", groceriesMinor: 1_073, hours: "" }),
+      expect.objectContaining({ date: "2026-01-12", groceriesMinor: 1_073, hours: "" }),
+    ]);
+    expect(workRows).toEqual([
+      expect.objectContaining({
+        date: "2026-01-12",
+        groceriesMinor: null,
+        hours: "4",
+        rateMinor: 6_000,
+        comment: "",
+      }),
+    ]);
   });
 });
 

@@ -4,6 +4,8 @@ interface ModalFrameProps {
   title: string;
   eyebrow?: string;
   children: ReactNode;
+  className?: string;
+  headerActions?: ReactNode;
   closeDisabled?: boolean;
   descriptionId?: string;
   onClose: () => void;
@@ -15,6 +17,8 @@ export function ModalFrame({
   title,
   eyebrow,
   children,
+  className,
+  headerActions,
   closeDisabled = false,
   descriptionId,
   onClose,
@@ -92,24 +96,27 @@ export function ModalFrame({
         aria-describedby={descriptionId}
         aria-labelledby={titleId}
         aria-modal="true"
-        className={`modal-card${wide ? " modal-card--wide" : ""}`}
+        className={`modal-card${wide ? " modal-card--wide" : ""}${className ? ` ${className}` : ""}`}
         role={role}
       >
         <header className="modal-header">
-          <div>
+          <div className="modal-header-copy">
             {eyebrow ? <p className="eyebrow">{eyebrow}</p> : null}
             <h2 id={titleId}>{title}</h2>
           </div>
-          <button
-            ref={closeRef}
-            aria-label={`Close ${title}`}
-            className="icon-button"
-            disabled={closeDisabled}
-            type="button"
-            onClick={onClose}
-          >
-            ×
-          </button>
+          <div className="modal-header-actions">
+            {headerActions}
+            <button
+              ref={closeRef}
+              aria-label={`Close ${title}`}
+              className="icon-button"
+              disabled={closeDisabled}
+              type="button"
+              onClick={onClose}
+            >
+              ×
+            </button>
+          </div>
         </header>
         {children}
       </section>

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   INVOICE_EXPORT_HEADERS,
+  INVOICE_PAYMENT_NOTE,
   invoiceToCells,
   invoiceToCsv,
   invoiceToTsv,
@@ -78,7 +79,7 @@ describe("invoice tabular exports", () => {
       ["05/12", "10.73", "4.50", "45.00", "202.50", "Key Foods"],
       ["05/13", "", "", "", "0.00", "'  =not-a-formula"],
       ["Total", "10.73", "4.50", "", "202.50", ""],
-      ["Grand Total", "", "", "", "213.23", "Groceries + Labour"],
+      ["Grand Total", "", "", "", "213.23", INVOICE_PAYMENT_NOTE],
     ]);
     expect(cells.every((tableRow) => tableRow.length === 6)).toBe(true);
   });
@@ -118,17 +119,17 @@ describe("invoice tabular exports", () => {
       "Grand Total",
     ]);
     expect(cells.at(-2)?.[1]).toBe("4.00");
-    expect(cells.at(-1)).toEqual(["Grand Total", "", "", "", "409.00", "Groceries + Labour"]);
+    expect(cells.at(-1)).toEqual(["Grand Total", "", "", "", "409.00", INVOICE_PAYMENT_NOTE]);
   });
 
   it("writes both component totals and the combined grand total to TSV and CSV", () => {
     const document = invoice([row()]);
 
     expect(invoiceToTsv(document, { includeTotals: true })).toContain(
-      "Total\t10.73\t4.50\t\t202.50\t\n" + "Grand Total\t\t\t\t213.23\tGroceries + Labour\n"
+      `Total\t10.73\t4.50\t\t202.50\t\nGrand Total\t\t\t\t213.23\t${INVOICE_PAYMENT_NOTE}\n`
     );
     expect(invoiceToCsv(document, { includeTotals: true })).toContain(
-      "Total,10.73,4.50,,202.50,\n" + "Grand Total,,,,213.23,Groceries + Labour\n"
+      `Total,10.73,4.50,,202.50,\nGrand Total,,,,213.23,${INVOICE_PAYMENT_NOTE}\n`
     );
   });
 
