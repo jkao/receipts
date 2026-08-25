@@ -205,7 +205,7 @@ export default function App() {
     | null
   >(null);
   const reloadInvoiceFromDiskRef = useRef<(() => Promise<void>) | null>(null);
-  const dismissedCheckKeyRef = useRef<string | null>(null);
+  const minimizedInvoiceCheckIdsRef = useRef(new Set<string>());
   const invoiceCheckResultRef = useRef<InvoiceCheckResult | null>(invoiceCheckResult);
   currentInvoiceRef.current = invoice;
   rowsRef.current = rows;
@@ -222,16 +222,26 @@ export default function App() {
       window.clearTimeout(checkRetryTimerRef.current);
       checkRetryTimerRef.current = null;
     }
-    dismissedCheckKeyRef.current = null;
     invoiceCheckResultRef.current = null;
     setInvoiceCheckResult(null);
-    setCheckSummaryVisible(true);
+    setCheckSummaryVisible(false);
   }, []);
 
   const dismissInvoiceCheck = useCallback(() => {
     const current = currentInvoiceRef.current;
-    if (current) dismissedCheckKeyRef.current = `${current.id}:${current.revision}`;
+    if (current) minimizedInvoiceCheckIdsRef.current.add(current.id);
     setCheckSummaryVisible(false);
+  }, []);
+
+  const expandInvoiceCheck = useCallback(() => {
+    const current = currentInvoiceRef.current;
+    if (current) minimizedInvoiceCheckIdsRef.current.delete(current.id);
+    setCheckSummaryVisible(true);
+  }, []);
+
+  const resetInvoiceCheckMinimization = useCallback((invoiceId: string) => {
+    minimizedInvoiceCheckIdsRef.current.delete(invoiceId);
+    if (currentInvoiceRef.current?.id === invoiceId) setCheckSummaryVisible(true);
   }, []);
 
   const clearBuiltOutput = useCallback(() => setBuiltOutput(null), []);
@@ -305,7 +315,6 @@ export default function App() {
       ) {
         return existing;
       }
-      if (!options.force && dismissedCheckKeyRef.current === key) return null;
       if (!options.force && checkInFlightRef.current?.key === key) return null;
       if (!options.force && checkRetryKeyRef.current === key) return null;
       if (!options.force && (checkRetryAttemptsRef.current.get(key) ?? 0) >= 3) return null;
@@ -316,7 +325,7 @@ export default function App() {
           window.clearTimeout(checkRetryTimerRef.current);
           checkRetryTimerRef.current = null;
         }
-        dismissedCheckKeyRef.current = null;
+        minimizedInvoiceCheckIdsRef.current.delete(invoiceId);
         setCheckSummaryVisible(true);
       }
 
@@ -360,7 +369,8 @@ export default function App() {
         invoiceCheckResultRef.current = result;
         setCheckSummaryVisible(
           options.force ||
-            (dismissedCheckKeyRef.current !== key && hasInvoiceCheckAttention(result.issues))
+            (!minimizedInvoiceCheckIdsRef.current.has(invoiceId) &&
+              hasInvoiceCheckAttention(result.issues))
         );
         setInvoiceCheckResult(result);
         return result;
@@ -489,7 +499,6 @@ export default function App() {
       }
       if (options.checkResult) {
         checkGenerationRef.current += 1;
-        dismissedCheckKeyRef.current = null;
         invoiceCheckResultRef.current = options.checkResult;
         setInvoiceCheckResult(options.checkResult);
       } else {
@@ -1094,8 +1103,9 @@ export default function App() {
                   ? (startedPaths[0].split("/").pop() ?? "Receipt")
                   : `${startedPaths.length} receipts`,
             });
-            if (jobActive && currentInvoiceRef.current?.id === invoice.id) {
-              adoptInvoice(result.invoice, { persistSort: false });
+            if (currentInvoiceRef.current?.id === invoice.id) {
+              if (result.importedCount > 0) resetInvoiceCheckMinimization(invoice.id);
+              if (jobActive) adoptInvoice(result.invoice, { persistSort: false });
             }
           },
         });
@@ -1137,6 +1147,7 @@ export default function App() {
       importJobs.registerJob,
       invoice,
       pushToast,
+      resetInvoiceCheckMinimization,
       settings?.hasOpenAiKey,
     ]
   );
@@ -1746,12 +1757,15 @@ export default function App() {
               </div>
             </div>
 
-            {invoiceCheckResult && checkSummaryVisible ? (
+            {invoiceCheckResult &&
+            (checkSummaryVisible || minimizedInvoiceCheckIdsRef.current.has(invoice.id)) ? (
               <InvoiceCheckSummary
                 disabled={currentInvoiceLocked}
+                minimized={!checkSummaryVisible}
                 result={invoiceCheckResult}
                 updatingFingerprints={updatingReviewFingerprints}
                 onDismiss={dismissInvoiceCheck}
+                onExpand={expandInvoiceCheck}
                 onToggle={(fingerprint, acknowledged) =>
                   void setReviewAcknowledgement(fingerprint, acknowledged)
                 }

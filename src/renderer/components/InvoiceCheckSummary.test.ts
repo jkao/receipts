@@ -75,4 +75,23 @@ describe("InvoiceCheckSummary", () => {
     expect(markup).not.toContain('type="checkbox"');
     expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Dismiss<\/button>/);
   });
+
+  it("renders a compact summary with a control to show the details again", () => {
+    const markup = renderToStaticMarkup(
+      createElement(InvoiceCheckSummary, {
+        disabled: false,
+        minimized: true,
+        result: result([issue({ message: "Keep this detail hidden." })]),
+        updatingFingerprints: new Set<string>(),
+        onDismiss: vi.fn(),
+        onExpand: vi.fn(),
+        onToggle: vi.fn(),
+      })
+    );
+
+    expect(markup).toContain("1 review item remaining");
+    expect(markup).toContain("Details are minimized until reopened or receipts are imported.");
+    expect(markup).toContain("Show details");
+    expect(markup).not.toContain("Keep this detail hidden.");
+  });
 });

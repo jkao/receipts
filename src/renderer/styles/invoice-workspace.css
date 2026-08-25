@@ -48,6 +48,15 @@
   gap: 14px;
 }
 
+.invoice-check--minimized {
+  align-items: center;
+  padding-block: 8px;
+}
+
+.invoice-check--minimized .invoice-check-heading {
+  align-items: center;
+}
+
 .invoice-check-heading > div {
   display: grid;
   gap: 2px;

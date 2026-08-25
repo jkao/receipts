@@ -10,9 +10,11 @@ import { ReviewChecklistItem } from "./ReviewChecklistItem";
 
 interface InvoiceCheckSummaryProps {
   disabled: boolean;
+  minimized?: boolean;
   result: InvoiceCheckResult;
   updatingFingerprints: ReadonlySet<string>;
   onDismiss: () => void;
+  onExpand?: () => void;
   onToggle: (fingerprint: string, acknowledged: boolean) => void;
 }
 
@@ -22,9 +24,11 @@ function affectedRowCount(issues: readonly InvoiceCheckIssue[]): number {
 
 export function InvoiceCheckSummary({
   disabled,
+  minimized = false,
   result,
   updatingFingerprints,
   onDismiss,
+  onExpand,
   onToggle,
 }: InvoiceCheckSummaryProps) {
   const titleId = useId();
@@ -41,6 +45,14 @@ export function InvoiceCheckSummary({
   const rowCount = affectedRowCount(unresolvedIssues);
   const unlinkedIssueCount = unresolvedIssues.filter((issue) => issue.rowIds.length === 0).length;
   const needsAttention = hasInvoiceCheckAttention(result.issues);
+  const summaryTitle =
+    unresolvedIssues.length > 0
+      ? `${unresolvedIssues.length} review ${unresolvedIssues.length === 1 ? "item" : "items"} remaining`
+      : reviewIssues.length > 0
+        ? "Review checklist complete"
+        : operationalIssues.length > 0
+          ? "No review checklist items"
+          : "Invoice check found no issues";
 
   const affectedRowsCopy =
     rowCount === 0
@@ -53,6 +65,30 @@ export function InvoiceCheckSummary({
             : ""
         }`;
 
+  if (minimized) {
+    return (
+      <section
+        aria-labelledby={titleId}
+        className={`invoice-check invoice-check--minimized${needsAttention ? " invoice-check--warning" : " invoice-check--clear"}`}
+      >
+        <span className="invoice-check-icon" aria-hidden="true">
+          {needsAttention ? "!" : "✓"}
+        </span>
+        <div className="invoice-check-content">
+          <div className="invoice-check-heading">
+            <div>
+              <h2 id={titleId}>{summaryTitle}</h2>
+              <p role="status">Details are minimized until reopened or receipts are imported.</p>
+            </div>
+            <button className="text-button" disabled={disabled} type="button" onClick={onExpand}>
+              Show details
+            </button>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section
       aria-labelledby={titleId}
@@ -64,15 +100,7 @@ export function InvoiceCheckSummary({
       <div className="invoice-check-content">
         <div className="invoice-check-heading">
           <div>
-            <h2 id={titleId}>
-              {unresolvedIssues.length > 0
-                ? `${unresolvedIssues.length} review ${unresolvedIssues.length === 1 ? "item" : "items"} remaining`
-                : reviewIssues.length > 0
-                  ? "Review checklist complete"
-                  : operationalIssues.length > 0
-                    ? "No review checklist items"
-                    : "Invoice check found no issues"}
-            </h2>
+            <h2 id={titleId}>{summaryTitle}</h2>
             <p role="status">
               {affectedRowsCopy}
               {reviewIssues.length > unresolvedIssues.length
