@@ -134,6 +134,25 @@ export function registerIpcHandlers(deps: Dependencies): void {
   handle(IPC.invoiceExport, (invoiceId, options) =>
     deps.exporter.exportPackage(invoiceId, options)
   );
+  handle(IPC.invoiceBackup, async (invoiceId, expectedRevision) => {
+    const result = await dialog.showOpenDialog(requiredWindow(deps), {
+      title: "Choose a folder for the invoice backup",
+      buttonLabel: "Save Backup Here",
+      message: "Choose a folder outside the live invoice state folder.",
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    return {
+      canceled: false,
+      outputPath: await deps.invoices.backupInvoice(
+        invoiceId,
+        result.filePaths[0],
+        expectedRevision
+      ),
+    };
+  });
 }
 
 function requiredWindow(deps: Dependencies): BrowserWindow {

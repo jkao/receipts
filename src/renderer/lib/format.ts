@@ -125,3 +125,26 @@ export function todayIso(): string {
   const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 10);
 }
+
+export function addIsoDays(value: string, days: number): string {
+  const date = parseIsoDate(value);
+  if (!date || !Number.isInteger(days)) return value;
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+export function suggestNewInvoicePeriod(
+  invoices: readonly InvoiceSummary[],
+  today = todayIso()
+): { startDate: string; endDate: string } {
+  const latestEndDate = invoices.reduce<string | null>(
+    (latest, invoice) =>
+      latest === null || invoice.period.endDate > latest ? invoice.period.endDate : latest,
+    null
+  );
+  if (!latestEndDate) {
+    return { startDate: `${today.slice(0, 8)}01`, endDate: today };
+  }
+  const startDate = addIsoDays(latestEndDate, 1);
+  return { startDate, endDate: startDate > today ? startDate : today };
+}

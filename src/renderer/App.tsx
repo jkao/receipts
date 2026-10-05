@@ -56,6 +56,7 @@ import {
   invoiceToSummary,
   messageFromError,
   newRowId,
+  suggestNewInvoicePeriod,
   todayIso,
 } from "./lib/format";
 import {
@@ -101,6 +102,7 @@ interface InvoiceCheckRefreshOptions {
 }
 
 type BusyAction =
+  | "backup"
   | "build-output"
   | "check"
   | "copy"
@@ -237,11 +239,6 @@ export default function App() {
     const current = currentInvoiceRef.current;
     if (current) minimizedInvoiceCheckIdsRef.current.delete(current.id);
     setCheckSummaryVisible(true);
-  }, []);
-
-  const resetInvoiceCheckMinimization = useCallback((invoiceId: string) => {
-    minimizedInvoiceCheckIdsRef.current.delete(invoiceId);
-    if (currentInvoiceRef.current?.id === invoiceId) setCheckSummaryVisible(true);
   }, []);
 
   const clearBuiltOutput = useCallback(() => setBuiltOutput(null), []);
@@ -1080,6 +1077,7 @@ export default function App() {
       });
       try {
         await autosave.flush();
+        let importedRowIds: string[] = [];
         const {
           importedCount,
           duplicates: allDuplicates,
@@ -1094,6 +1092,14 @@ export default function App() {
               `${duplicates.length} receipt${duplicates.length === 1 ? " was" : "s were"} already used in another invoice. Import ${duplicates.length === 1 ? "it" : "them"} here too?`
             ),
           onStarted: (result, startedPaths) => {
+            const previousRowIds = new Set(
+              currentInvoiceRef.current?.id === invoice.id
+                ? currentInvoiceRef.current.rows.map((row) => row.id)
+                : []
+            );
+            importedRowIds = result.invoice.rows
+              .filter((row) => !previousRowIds.has(row.id))
+              .map((row) => row.id);
             const jobActive = importJobs.registerJob({
               jobId: result.jobId,
               invoiceId: invoice.id,
@@ -1104,7 +1110,6 @@ export default function App() {
                   : `${startedPaths.length} receipts`,
             });
             if (currentInvoiceRef.current?.id === invoice.id) {
-              if (result.importedCount > 0) resetInvoiceCheckMinimization(invoice.id);
               if (jobActive) adoptInvoice(result.invoice, { persistSort: false });
             }
           },
@@ -1114,7 +1119,16 @@ export default function App() {
             settings?.hasOpenAiKey
               ? `${importedCount} receipt${importedCount === 1 ? "" : "s"} added locally; scanning continues in the background.`
               : `${importedCount} receipt${importedCount === 1 ? "" : "s"} added locally. Add an OpenAI key to scan ${importedCount === 1 ? "it" : "them"}.`,
-            "success"
+            "success",
+            importedRowIds[0]
+              ? {
+                  label: importedCount === 1 ? "Open receipt" : "Open first receipt",
+                  run: () => {
+                    if (currentInvoiceRef.current?.id !== invoice.id) return;
+                    setDetailRowId(importedRowIds[0] ?? null);
+                  },
+                }
+              : undefined
           );
         }
         if (allErrors.length > 0) {
@@ -1147,7 +1161,6 @@ export default function App() {
       importJobs.registerJob,
       invoice,
       pushToast,
-      resetInvoiceCheckMinimization,
       settings?.hasOpenAiKey,
     ]
   );
@@ -1292,8 +1305,22 @@ export default function App() {
       const document = await window.receiptApp.deleteRows(invoiceId, [...selectedRows]);
       if (currentInvoiceRef.current?.id !== invoiceId) return;
       adoptInvoice(document);
-      pushToast(`${count} row${count === 1 ? "" : "s"} deleted.`, "neutral", {
-        label: "Undo",
+      const onlyDeletedRow = count === 1 ? rows.find((row) => selectedRows.has(row.id)) : undefined;
+      const deletedReceipt = onlyDeletedRow?.receiptId
+        ? invoice.receipts.find((receipt) => receipt.id === onlyDeletedRow.receiptId)
+        : undefined;
+      const deletedLabel =
+        count > 1
+          ? `${count} rows`
+          : deletedReceipt?.originalFilename ||
+            onlyDeletedRow?.comment.trim() ||
+            onlyDeletedRow?.date ||
+            "row";
+      pushToast(`Deleted ${deletedLabel}.`, "neutral", {
+        label:
+          count > 1
+            ? `Undo ${count} rows`
+            : `Undo ${deletedLabel.length > 24 ? "row" : deletedLabel}`,
         run: () => {
           if (currentInvoiceRef.current?.id !== invoiceId) {
             pushToast("Undo is only available while the original invoice is open.");
@@ -1337,8 +1364,29 @@ export default function App() {
     clearBuiltOutput,
     invoice,
     pushToast,
+    rows,
     selectedRows,
   ]);
+
+  const backupInvoice = async () => {
+    if (!invoice || busyAction) return;
+    const invoiceId = invoice.id;
+    setBusyAction("backup");
+    try {
+      const savedDocument = await autosave.flush();
+      const documentToBackup = savedDocument ?? currentInvoiceRef.current;
+      if (!documentToBackup || documentToBackup.id !== invoiceId) return;
+      const result = await window.receiptApp.backupInvoice(invoiceId, documentToBackup.revision);
+      if (!result.canceled && result.outputPath) {
+        const folderName = result.outputPath.split(/[\\/]/).pop() ?? "backup folder";
+        pushToast(`Backup saved as ${folderName}.`, "success");
+      }
+    } catch (error) {
+      pushToast(`Backup failed: ${messageFromError(error)}`, "error");
+    } finally {
+      setBusyAction(null);
+    }
+  };
 
   const exportInvoice = async (asZip: boolean, includeDebug: boolean) => {
     if (!invoice) return;
@@ -1726,6 +1774,16 @@ export default function App() {
                 <button
                   className="button button--secondary"
                   disabled={currentInvoiceLocked}
+                  title="Copy the complete saved invoice outside the live invoice database"
+                  type="button"
+                  onClick={() => void backupInvoice()}
+                >
+                  <span aria-hidden="true">⧉</span>
+                  {busyAction === "backup" ? "Saving Backup…" : "Save Backup…"}
+                </button>
+                <button
+                  className="button button--secondary"
+                  disabled={currentInvoiceLocked}
                   type="button"
                   onClick={() => setExportOpen(true)}
                 >
@@ -1884,8 +1942,9 @@ export default function App() {
               <div className="grid-help-line">
                 {workspaceViewMode === "table" ? (
                   <span>
-                    Select a cell and press Enter, or double-click, to edit. Press ⌘⇧M to add a
-                    manual row. Tab from the final Comment cell to continue onto a new row.
+                    Select a cell and press Enter, or double-click, to edit. Tab moves directly
+                    through editable fields and skips calculated totals. Press ⌘⇧M to add a manual
+                    row; Tab from the final Comment cell continues onto a new row.
                   </span>
                 ) : (
                   <span>
@@ -1945,6 +2004,8 @@ export default function App() {
       {newInvoiceOpen ? (
         <NewInvoiceModal
           busy={busyAction === "create"}
+          existingInvoices={invoices}
+          initialPeriod={suggestNewInvoicePeriod(invoices)}
           onClose={() => setNewInvoiceOpen(false)}
           onCreate={createInvoice}
         />

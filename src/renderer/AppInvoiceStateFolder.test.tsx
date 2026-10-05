@@ -56,6 +56,41 @@ beforeEach(() => {
 });
 
 describe("invoice state folder", () => {
+  it("saves a complete backup of the current saved revision", async () => {
+    const currentInvoice = invoice(
+      "invoice-id",
+      "invoice-2026-08-01-2026-08-31",
+      "2026-08-25T12:00:00.000Z"
+    );
+    const backupInvoice = vi.fn().mockResolvedValue({
+      canceled: false,
+      outputPath: `/Backups/${currentInvoice.name}-backup-2026-08-25`,
+    });
+    const api = {
+      getSettings: vi.fn().mockResolvedValue({
+        baseFolder: "/Invoices",
+        hasOpenAiKey: true,
+        defaultRateMinor: 4_500,
+      }),
+      listInvoices: vi.fn().mockResolvedValue([summary(currentInvoice)]),
+      loadInvoice: vi.fn().mockResolvedValue(currentInvoice),
+      backupInvoice,
+      onImportProgress: vi.fn(() => () => undefined),
+    } as unknown as DesktopApi;
+    Object.defineProperty(window, "receiptApp", {
+      configurable: true,
+      value: api,
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Save Backup…" }));
+
+    await waitFor(() => expect(backupInvoice).toHaveBeenCalledWith(currentInvoice.id, 1));
+    expect(
+      await screen.findByText(`Backup saved as ${currentInvoice.name}-backup-2026-08-25.`)
+    ).toBeTruthy();
+  });
+
   it("switches the app to the invoices at the newly selected path", async () => {
     const oldInvoice = invoice(
       "old-invoice",

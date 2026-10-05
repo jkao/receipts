@@ -1,12 +1,19 @@
 import { useId, useState } from "react";
-import type { InvoicePeriod, InvoiceRemovalResult, SettingsView } from "../../shared/types";
-import { messageFromError, parseMoneyInput, todayIso } from "../lib/format";
+import type {
+  InvoicePeriod,
+  InvoiceRemovalResult,
+  InvoiceSummary,
+  SettingsView,
+} from "../../shared/types";
+import { messageFromError, parseMoneyInput } from "../lib/format";
 import { ModalFrame } from "./ModalFrame";
 import { ReceiptUploadDisclosure } from "./ReceiptUploadDisclosure";
 import type { ToastTone } from "./ToastRegion";
 
 interface NewInvoiceModalProps {
   busy: boolean;
+  existingInvoices: readonly InvoiceSummary[];
+  initialPeriod: InvoicePeriod;
   onClose: () => void;
   onCreate: (period: InvoicePeriod) => Promise<void>;
 }
@@ -17,11 +24,22 @@ function invoicePeriodError(startDate: string, endDate: string): string | null {
   return null;
 }
 
-export function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProps) {
-  const today = todayIso();
-  const [startDate, setStartDate] = useState(`${today.slice(0, 8)}01`);
-  const [endDate, setEndDate] = useState(today);
+export function NewInvoiceModal({
+  busy,
+  existingInvoices,
+  initialPeriod,
+  onClose,
+  onCreate,
+}: NewInvoiceModalProps) {
+  const [startDate, setStartDate] = useState(initialPeriod.startDate);
+  const [endDate, setEndDate] = useState(initialPeriod.endDate);
   const [error, setError] = useState<string | null>(null);
+  const overlappingInvoice =
+    invoicePeriodError(startDate, endDate) === null
+      ? existingInvoices.find(
+          (invoice) => startDate <= invoice.period.endDate && endDate >= invoice.period.startDate
+        )
+      : undefined;
 
   return (
     <ModalFrame closeDisabled={busy} eyebrow="Invoice period" title="New Invoice" onClose={onClose}>
@@ -32,6 +50,14 @@ export function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProp
           const validationError = invoicePeriodError(startDate, endDate);
           if (validationError) {
             setError(validationError);
+            return;
+          }
+          if (
+            overlappingInvoice &&
+            !window.confirm(
+              `These dates overlap ${overlappingInvoice.name} (${overlappingInvoice.period.startDate} through ${overlappingInvoice.period.endDate}). Create another overlapping invoice?`
+            )
+          ) {
             return;
           }
           setError(null);
@@ -51,7 +77,10 @@ export function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProp
               required
               type="date"
               value={startDate}
-              onChange={(event) => setStartDate(event.target.value)}
+              onChange={(event) => {
+                setError(null);
+                setStartDate(event.target.value);
+              }}
             />
           </label>
           <span className="date-range-arrow" aria-hidden="true">
@@ -65,13 +94,22 @@ export function NewInvoiceModal({ busy, onClose, onCreate }: NewInvoiceModalProp
               min={startDate}
               type="date"
               value={endDate}
-              onChange={(event) => setEndDate(event.target.value)}
+              onChange={(event) => {
+                setError(null);
+                setEndDate(event.target.value);
+              }}
             />
           </label>
         </div>
         {error ? (
           <p className="form-error" role="alert">
             {error}
+          </p>
+        ) : null}
+        {overlappingInvoice && !error ? (
+          <p className="form-warning" role="status">
+            This period overlaps {overlappingInvoice.name}. You will be asked to confirm before it
+            is created.
           </p>
         ) : null}
         <footer className="modal-actions">

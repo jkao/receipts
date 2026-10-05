@@ -189,6 +189,51 @@ describe("InvoiceGrid editors", () => {
     expect(onRowsChange.mock.calls[0][0]).toEqual([{ ...row, comment: "Committed value" }]);
   });
 
+  it("moves Tab directly through editable fields and skips the computed total", async () => {
+    exposeAllGridColumns();
+    const user = userEvent.setup();
+
+    function GridHarness() {
+      const [rows, setRows] = useState([row]);
+      return (
+        <InvoiceGrid
+          activeRowId={null}
+          receipts={[]}
+          rows={rows}
+          selectedRows={new Set()}
+          sortColumns={[]}
+          totals={{
+            groceriesMinor: 500,
+            hours: "1.00",
+            labourMinor: 4_500,
+            invoiceMinor: 5_000,
+          }}
+          onDeleteSelected={vi.fn()}
+          onOpenRow={vi.fn()}
+          onRowsChange={setRows}
+          onSelectedRowsChange={vi.fn()}
+          onSortColumnsChange={vi.fn()}
+        />
+      );
+    }
+
+    render(<GridHarness />);
+    const dateCell = screen
+      .getAllByText("08/20")
+      .find((element) => element.getAttribute("role") === "gridcell");
+    expect(dateCell).toBeTruthy();
+    await user.dblClick(dateCell as HTMLElement);
+
+    await user.keyboard("{Tab}");
+    expect(await screen.findByRole("textbox", { name: "Groceries amount" })).toBeTruthy();
+    await user.keyboard("{Tab}");
+    expect(await screen.findByRole("textbox", { name: "Hours worked" })).toBeTruthy();
+    await user.keyboard("{Tab}");
+    expect(await screen.findByRole("textbox", { name: "Hourly rate" })).toBeTruthy();
+    await user.keyboard("{Tab}");
+    expect(await screen.findByRole("textbox", { name: "Comment" })).toBeTruthy();
+  });
+
   it("keeps an invalid local draft open when another grid cell is clicked", async () => {
     exposeAllGridColumns();
     const user = userEvent.setup();

@@ -159,6 +159,55 @@ describe("receipt picker IPC", () => {
     expect(removeInvoice).toHaveBeenCalledWith("invoice-1", options);
   });
 
+  it("chooses a backup destination and delegates a revision-checked snapshot", async () => {
+    const window = {};
+    const backupInvoice = vi
+      .fn()
+      .mockResolvedValue("/Backups/invoice-2026-01-01-2026-01-31-backup-2026-08-25");
+    electron.showOpenDialog.mockResolvedValue({ canceled: false, filePaths: ["/Backups"] });
+    registerIpcHandlers({
+      settings: {} as never,
+      invoices: { backupInvoice } as never,
+      checker: {} as never,
+      importer: {} as never,
+      trash: {} as never,
+      exporter: {} as never,
+      output: {} as never,
+      getWindow: () => window as never,
+    });
+
+    await expect(invoke(IPC.invoiceBackup, "invoice-1", 7)).resolves.toEqual({
+      canceled: false,
+      outputPath: "/Backups/invoice-2026-01-01-2026-01-31-backup-2026-08-25",
+    });
+    expect(electron.showOpenDialog).toHaveBeenCalledWith(
+      window,
+      expect.objectContaining({
+        buttonLabel: "Save Backup Here",
+        properties: ["openDirectory", "createDirectory"],
+      })
+    );
+    expect(backupInvoice).toHaveBeenCalledWith("invoice-1", "/Backups", 7);
+  });
+
+  it("does not create a backup when its destination picker is canceled", async () => {
+    const backupInvoice = vi.fn();
+    electron.showOpenDialog.mockResolvedValue({ canceled: true, filePaths: ["/ignored"] });
+    registerIpcHandlers({
+      settings: {} as never,
+      invoices: { backupInvoice } as never,
+      checker: {} as never,
+      importer: {} as never,
+      trash: {} as never,
+      exporter: {} as never,
+      output: {} as never,
+      getWindow: () => ({}) as never,
+    });
+
+    await expect(invoke(IPC.invoiceBackup, "invoice-1", 7)).resolves.toEqual({ canceled: true });
+    expect(backupInvoice).not.toHaveBeenCalled();
+  });
+
   it("delegates revision-checked invoice period updates", async () => {
     const result = {
       id: "invoice-1",

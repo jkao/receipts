@@ -27,5 +27,6 @@ export const IPC = {
   invoiceBuildOutput: "invoice:build-output",
   invoiceRevealOutput: "invoice:reveal-output",
   invoiceExport: "invoice:export",
+  invoiceBackup: "invoice:backup",
   importProgress: "import:progress",
 } as const;

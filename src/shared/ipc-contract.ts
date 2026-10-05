@@ -8,6 +8,7 @@ import type {
   ImportJobStartResult,
   ImportProgress,
   InvoiceCheckResult,
+  InvoiceBackupResult,
   InvoiceDocument,
   InvoiceOutputResult,
   InvoicePeriod,
@@ -84,6 +85,7 @@ export interface IpcRequestContract {
     [invoiceId: string, options: ExportPackageOptions],
     ExportPackageResult
   >;
+  [IPC.invoiceBackup]: Request<[invoiceId: string, expectedRevision: number], InvoiceBackupResult>;
 }
 
 export interface IpcEventContract {

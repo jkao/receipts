@@ -41,6 +41,11 @@ import { buildInvoiceSummaryRows, type InvoiceSummaryRow } from "../lib/invoiceS
 
 const EMPTY_CHECK_ISSUES = new Map<string, readonly InvoiceCheckIssue[]>();
 const rowKeyGetter = (row: InvoiceRow) => row.id;
+type EditorNavigationDirection = "forward" | "backward";
+
+interface EditorNavigationProps {
+  onNavigate?: (direction: EditorNavigationDirection) => boolean;
+}
 
 interface InvoiceGridProps {
   rows: InvoiceRow[];
@@ -79,7 +84,8 @@ export function DateEditor({
   row,
   onRowChange,
   onClose,
-}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow>) {
+  onNavigate,
+}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow> & EditorNavigationProps) {
   const [value, setValue] = useState(row.date ?? "");
   const [nativeError, setNativeError] = useState<string | null>(null);
   const errorId = useId();
@@ -140,6 +146,12 @@ export function DateEditor({
               event.preventDefault();
               event.stopPropagation();
               keepInvalidEditorOpen(event.currentTarget);
+            } else if (
+              event.key === "Tab" &&
+              onNavigate?.(event.shiftKey ? "backward" : "forward")
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
             }
           }
           if (event.key === "Escape") onClose(false);
@@ -154,12 +166,21 @@ export function DateEditor({
   );
 }
 
-interface MoneyEditorProps extends RenderEditCellProps<InvoiceRow, InvoiceSummaryRow> {
+interface MoneyEditorProps
+  extends RenderEditCellProps<InvoiceRow, InvoiceSummaryRow>,
+    EditorNavigationProps {
   field: "groceriesMinor" | "rateMinor";
   label: string;
 }
 
-export function MoneyEditor({ row, onRowChange, onClose, field, label }: MoneyEditorProps) {
+export function MoneyEditor({
+  row,
+  onRowChange,
+  onClose,
+  onNavigate,
+  field,
+  label,
+}: MoneyEditorProps) {
   const [value, setValue] = useState(minorToInput(row[field]));
   const errorId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -212,6 +233,12 @@ export function MoneyEditor({ row, onRowChange, onClose, field, label }: MoneyEd
               event.preventDefault();
               event.stopPropagation();
               keepInvalidEditorOpen(event.currentTarget);
+            } else if (
+              event.key === "Tab" &&
+              onNavigate?.(event.shiftKey ? "backward" : "forward")
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
             }
           }
           if (event.key === "Escape") onClose(false);
@@ -230,7 +257,8 @@ export function HoursEditor({
   row,
   onRowChange,
   onClose,
-}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow>) {
+  onNavigate,
+}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow> & EditorNavigationProps) {
   const [value, setValue] = useState(row.hours);
   const errorId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -285,6 +313,12 @@ export function HoursEditor({
               event.preventDefault();
               event.stopPropagation();
               keepInvalidEditorOpen(event.currentTarget);
+            } else if (
+              event.key === "Tab" &&
+              onNavigate?.(event.shiftKey ? "backward" : "forward")
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
             }
           }
           if (event.key === "Escape") onClose(false);
@@ -303,10 +337,8 @@ export function CommentEditor({
   row,
   onRowChange,
   onClose,
-  onTabFromLastRow,
-}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow> & {
-  onTabFromLastRow?: () => boolean;
-}) {
+  onNavigate,
+}: RenderEditCellProps<InvoiceRow, InvoiceSummaryRow> & EditorNavigationProps) {
   const [value, setValue] = useState(row.comment);
   const committedRef = useRef(false);
 
@@ -316,6 +348,7 @@ export function CommentEditor({
       if (value === row.comment) onClose(false);
       else onRowChange({ ...row, comment: value }, true);
     }
+    return true;
   };
 
   return (
@@ -334,7 +367,7 @@ export function CommentEditor({
         if (event.key === "Enter" || event.key === "Tab") {
           if (event.key === "Enter") event.preventDefault();
           commit();
-          if (event.key === "Tab" && !event.shiftKey && onTabFromLastRow?.()) {
+          if (event.key === "Tab" && onNavigate?.(event.shiftKey ? "backward" : "forward")) {
             event.preventDefault();
             event.stopPropagation();
           }
@@ -370,6 +403,7 @@ export function InvoiceGrid({
   const pendingTabRowIdRef = useRef<string | null>(null);
   const provisionalRowRef = useRef<InvoiceRow | null>(null);
   const discardTimerRef = useRef<number | null>(null);
+  const navigationTimerRef = useRef<number | null>(null);
   const latestRowsRef = useRef(rows);
   latestRowsRef.current = rows;
   const receiptById = useMemo(
@@ -391,9 +425,9 @@ export function InvoiceGrid({
     if (!focusRowId || disabled) return;
     const rowIdx = rows.findIndex((row) => row.id === focusRowId);
     if (rowIdx < 0) return;
-    gridRef.current?.scrollToCell({ rowIdx, idx: 2 });
+    gridRef.current?.scrollToCell({ rowIdx, idx: 1 });
     gridRef.current?.setActivePosition(
-      { rowIdx, idx: 2 },
+      { rowIdx, idx: 1 },
       { enableEditor: true, shouldFocus: true }
     );
     onFocusRowHandled?.();
@@ -424,9 +458,24 @@ export function InvoiceGrid({
   useEffect(
     () => () => {
       if (discardTimerRef.current !== null) window.clearTimeout(discardTimerRef.current);
+      if (navigationTimerRef.current !== null) window.clearTimeout(navigationTimerRef.current);
     },
     []
   );
+
+  const activateEditor = useCallback((rowId: string, columnIdx: number) => {
+    if (navigationTimerRef.current !== null) window.clearTimeout(navigationTimerRef.current);
+    navigationTimerRef.current = window.setTimeout(() => {
+      navigationTimerRef.current = null;
+      const rowIdx = latestRowsRef.current.findIndex((row) => row.id === rowId);
+      if (rowIdx < 0) return;
+      gridRef.current?.scrollToCell({ rowIdx, idx: columnIdx });
+      gridRef.current?.setActivePosition(
+        { rowIdx, idx: columnIdx },
+        { enableEditor: true, shouldFocus: true }
+      );
+    }, 0);
+  }, []);
 
   const ensureTrailingEmptyRow = useCallback((): boolean => {
     if (!onAppendEmptyRow) return false;
@@ -460,6 +509,43 @@ export function InvoiceGrid({
     return true;
   }, [onAppendEmptyRow]);
 
+  const navigateEditor = useCallback(
+    (rowId: string, columnIdx: number, direction: EditorNavigationDirection): boolean => {
+      const currentRows = latestRowsRef.current;
+      const rowIdx = currentRows.findIndex((row) => row.id === rowId);
+      if (rowIdx < 0) return false;
+      const editableColumnIndexes = [1, 2, 3, 4, 6] as const;
+      const editablePosition = editableColumnIndexes.indexOf(
+        columnIdx as (typeof editableColumnIndexes)[number]
+      );
+      if (editablePosition < 0) return false;
+
+      if (direction === "forward") {
+        const nextColumn = editableColumnIndexes[editablePosition + 1];
+        if (nextColumn !== undefined) {
+          activateEditor(rowId, nextColumn);
+          return true;
+        }
+        if (rowIdx === currentRows.length - 1) return ensureTrailingEmptyRow();
+        const nextRow = currentRows[rowIdx + 1];
+        if (!nextRow) return false;
+        activateEditor(nextRow.id, editableColumnIndexes[0]);
+        return true;
+      }
+
+      const previousColumn = editableColumnIndexes[editablePosition - 1];
+      if (previousColumn !== undefined) {
+        activateEditor(rowId, previousColumn);
+        return true;
+      }
+      const previousRow = currentRows[rowIdx - 1];
+      if (!previousRow) return false;
+      activateEditor(previousRow.id, editableColumnIndexes.at(-1) ?? 6);
+      return true;
+    },
+    [activateEditor, ensureTrailingEmptyRow]
+  );
+
   const scheduleEmptyRowCleanup = useCallback(() => {
     if (!provisionalRowRef.current || !onDiscardEmptyRow) return;
     if (discardTimerRef.current !== null) window.clearTimeout(discardTimerRef.current);
@@ -488,8 +574,6 @@ export function InvoiceGrid({
     return () => document.removeEventListener("focusin", handleFocusIn);
   }, [scheduleEmptyRowCleanup]);
 
-  const lastRowId = rows.at(-1)?.id;
-
   const columns = useMemo<Column<InvoiceRow, InvoiceSummaryRow>[]>(
     () => [
       { ...SelectColumn, width: 42, frozen: true },
@@ -503,7 +587,12 @@ export function InvoiceGrid({
         editable: !disabled,
         editorOptions: { commitOnOutsideClick: false },
         renderCell: ({ row }) => formatShortDate(row.date),
-        renderEditCell: DateEditor,
+        renderEditCell: (props) => (
+          <DateEditor
+            {...props}
+            onNavigate={(direction) => navigateEditor(props.row.id, 1, direction)}
+          />
+        ),
         renderSummaryCell: ({ row }) =>
           row.kind === "grand" ? (
             <strong className="grand-total-marker">Grand Total</strong>
@@ -525,7 +614,12 @@ export function InvoiceGrid({
         summaryCellClass: "money-cell",
         renderCell: ({ row }) => formatMoney(row.groceriesMinor),
         renderEditCell: (props) => (
-          <MoneyEditor {...props} field="groceriesMinor" label="Groceries amount" />
+          <MoneyEditor
+            {...props}
+            field="groceriesMinor"
+            label="Groceries amount"
+            onNavigate={(direction) => navigateEditor(props.row.id, 2, direction)}
+          />
         ),
         renderSummaryCell: ({ row }) =>
           row.kind === "components" ? <strong>{formatMoney(row.groceriesMinor)}</strong> : null,
@@ -541,7 +635,12 @@ export function InvoiceGrid({
         editorOptions: { commitOnOutsideClick: false },
         cellClass: "number-cell",
         summaryCellClass: "number-cell",
-        renderEditCell: HoursEditor,
+        renderEditCell: (props) => (
+          <HoursEditor
+            {...props}
+            onNavigate={(direction) => navigateEditor(props.row.id, 3, direction)}
+          />
+        ),
         renderSummaryCell: ({ row }) =>
           row.kind === "components" ? <strong>{formatHours(row.hours)}</strong> : null,
       },
@@ -556,7 +655,14 @@ export function InvoiceGrid({
         editorOptions: { commitOnOutsideClick: false },
         cellClass: "money-cell",
         renderCell: ({ row }) => (row.hours.trim() ? formatMoney(row.rateMinor) : ""),
-        renderEditCell: (props) => <MoneyEditor {...props} field="rateMinor" label="Hourly rate" />,
+        renderEditCell: (props) => (
+          <MoneyEditor
+            {...props}
+            field="rateMinor"
+            label="Hourly rate"
+            onNavigate={(direction) => navigateEditor(props.row.id, 4, direction)}
+          />
+        ),
       },
       {
         key: "labourTotal",
@@ -637,14 +743,14 @@ export function InvoiceGrid({
         renderEditCell: (props) => (
           <CommentEditor
             {...props}
-            onTabFromLastRow={props.row.id === lastRowId ? ensureTrailingEmptyRow : undefined}
+            onNavigate={(direction) => navigateEditor(props.row.id, 6, direction)}
           />
         ),
         renderSummaryCell: ({ row }) =>
           row.kind === "grand" ? <strong>Groceries + Labour</strong> : null,
       },
     ],
-    [checkIssuesByRow, disabled, ensureTrailingEmptyRow, lastRowId, onOpenRow, receiptById]
+    [checkIssuesByRow, disabled, navigateEditor, onOpenRow, receiptById]
   );
 
   return (

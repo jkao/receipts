@@ -242,6 +242,12 @@
   font-size: 11px;
 }
 
+.form-warning {
+  margin-top: 12px;
+  color: #795a17;
+  font-size: 11px;
+}
+
 .form-error--action {
   display: flex;
   align-items: center;

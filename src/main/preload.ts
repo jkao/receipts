@@ -190,6 +190,8 @@ const api: DesktopApi = {
   buildInvoiceOutput: (invoiceId) => invoke(IPC.invoiceBuildOutput, invoiceId),
   revealOutput: (invoiceId) => invoke(IPC.invoiceRevealOutput, invoiceId),
   exportPackage: (invoiceId, options) => invoke(IPC.invoiceExport, invoiceId, options),
+  backupInvoice: (invoiceId, expectedRevision) =>
+    invoke(IPC.invoiceBackup, invoiceId, expectedRevision),
   onImportProgress: (callback: (progress: ImportProgress) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, progress: ImportProgress) =>
       callback(progress);

@@ -23,6 +23,15 @@ vi.mock("electron", () => ({
 import "./preload";
 
 describe("receipt preload bridge", () => {
+  it("exposes revision-checked invoice backup creation", async () => {
+    const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
+    const result = { canceled: false, outputPath: "/Backups/invoice-backup" };
+    electron.invoke.mockReset().mockResolvedValue(result);
+
+    await expect(api.backupInvoice("invoice-1", 7)).resolves.toBe(result);
+    expect(electron.invoke).toHaveBeenCalledWith(IPC.invoiceBackup, "invoice-1", 7);
+  });
+
   it("passes a drag/drop path array and import options through unchanged", async () => {
     const api = electron.exposeInMainWorld.mock.calls[0]?.[1] as DesktopApi;
     const paths = ["/receipts/one.jpg", "/receipts/two.pdf"];

@@ -259,6 +259,11 @@ export interface ExportPackageResult {
   outputPath?: string;
 }
 
+export interface InvoiceBackupResult {
+  canceled: boolean;
+  outputPath?: string;
+}
+
 export interface InvoiceOutputResult {
   outputPath: string;
   archivePath: string;
@@ -332,5 +337,6 @@ export interface DesktopApi {
   buildInvoiceOutput(invoiceId: string): Promise<InvoiceOutputResult>;
   revealOutput(invoiceId: string): Promise<void>;
   exportPackage(invoiceId: string, options: ExportPackageOptions): Promise<ExportPackageResult>;
+  backupInvoice(invoiceId: string, expectedRevision: number): Promise<InvoiceBackupResult>;
   onImportProgress(callback: (progress: ImportProgress) => void): () => void;
 }

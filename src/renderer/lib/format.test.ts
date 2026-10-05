@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { InvoiceDocument, InvoiceRow } from "../../shared/types";
 import {
+  addIsoDays,
   calculateTotals,
   formatLongDate,
   formatMoney,
@@ -12,6 +13,7 @@ import {
   minorToInput,
   newRowId,
   parseMoneyInput,
+  suggestNewInvoicePeriod,
   todayIso,
 } from "./format";
 
@@ -121,5 +123,32 @@ describe("renderer formatting", () => {
     vi.setSystemTime(new Date("2026-08-21T15:30:00.000Z"));
     vi.spyOn(Date.prototype, "getTimezoneOffset").mockReturnValue(0);
     expect(todayIso()).toBe("2026-08-21");
+  });
+
+  it("suggests the next uncovered invoice period instead of overlapping the latest invoice", () => {
+    expect(addIsoDays("2026-02-28", 1)).toBe("2026-03-01");
+    expect(
+      suggestNewInvoicePeriod(
+        [
+          {
+            id: "older",
+            name: "invoice-2026-07-01-2026-07-31",
+            period: { startDate: "2026-07-01", endDate: "2026-07-31" },
+            rowCount: 0,
+            receiptCount: 0,
+            updatedAt: "2026-07-31T12:00:00.000Z",
+          },
+          {
+            id: "latest",
+            name: "invoice-2026-08-01-2026-08-24",
+            period: { startDate: "2026-08-01", endDate: "2026-08-24" },
+            rowCount: 0,
+            receiptCount: 0,
+            updatedAt: "2026-08-24T12:00:00.000Z",
+          },
+        ],
+        "2026-08-25"
+      )
+    ).toEqual({ startDate: "2026-08-25", endDate: "2026-08-25" });
   });
 });

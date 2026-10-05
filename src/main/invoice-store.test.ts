@@ -114,6 +114,69 @@ describe("InvoiceStore", () => {
     expect(idCounter).toBe(1);
   });
 
+  it("creates a revision-checked standalone backup without changing live state", async () => {
+    const backupParent = await fs.mkdtemp(path.join(os.tmpdir(), "receipt-invoice-backup-"));
+    try {
+      const created = await store.createInvoice(PERIOD, 4500);
+      const saved = await store.saveRows(created.id, [row()], created.revision);
+      const liveFolder = await store.getInvoiceFolder(created.id);
+      await fs.writeFile(path.join(liveFolder, "receipts", "receipt.jpg"), "receipt bytes");
+
+      const firstBackup = await store.backupInvoice(created.id, backupParent, saved.revision);
+      const secondBackup = await store.backupInvoice(created.id, backupParent, saved.revision);
+
+      expect(path.basename(firstBackup)).toBe(`${created.name}-backup-2026-02-01`);
+      expect(path.basename(secondBackup)).toBe(`${created.name}-backup-2026-02-01-2`);
+      await expect(
+        fs.readFile(path.join(firstBackup, "receipts", "receipt.jpg"), "utf8")
+      ).resolves.toBe("receipt bytes");
+      const copiedInvoice = validateInvoiceDocument(
+        JSON.parse(await fs.readFile(path.join(firstBackup, "invoice.json"), "utf8"))
+      );
+      expect(invoiceDocumentFingerprint(copiedInvoice)).toBe(invoiceDocumentFingerprint(saved));
+      await expect(store.loadInvoice(created.id)).resolves.toEqual(saved);
+    } finally {
+      await fs.rm(backupParent, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects stale backups and destinations inside the live state folder", async () => {
+    const backupParent = await fs.mkdtemp(path.join(os.tmpdir(), "receipt-invoice-backup-"));
+    try {
+      const created = await store.createInvoice(PERIOD, 4500);
+      const saved = await store.saveRows(created.id, [row()], created.revision);
+
+      await expect(
+        store.backupInvoice(created.id, backupParent, created.revision)
+      ).rejects.toBeInstanceOf(RevisionConflictError);
+      await expect(store.backupInvoice(created.id, baseFolder, saved.revision)).rejects.toThrow(
+        /outside the live invoice state folder/i
+      );
+      await expect(fs.readdir(backupParent)).resolves.toEqual([]);
+    } finally {
+      await fs.rm(backupParent, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects symlinks in a backup and removes its incomplete staging folder", async () => {
+    const backupParent = await fs.mkdtemp(path.join(os.tmpdir(), "receipt-invoice-backup-"));
+    try {
+      const created = await store.createInvoice(PERIOD, 4500);
+      const liveFolder = await store.getInvoiceFolder(created.id);
+      await fs.symlink(
+        path.join(liveFolder, "invoice.json"),
+        path.join(liveFolder, "receipt-link")
+      );
+
+      await expect(store.backupInvoice(created.id, backupParent, created.revision)).rejects.toThrow(
+        /cannot contain symbolic links/i
+      );
+      await expect(fs.readdir(backupParent)).resolves.toEqual([]);
+    } finally {
+      await fs.rm(backupParent, { recursive: true, force: true });
+    }
+  });
+
   it("soft-deletes with a visible sentinel and consistently hides the invoice", async () => {
     const created = await store.createInvoice(PERIOD, 4500);
     const withReceipt = await store.mutateInvoice(created.id, (draft) => {

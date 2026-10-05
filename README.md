@@ -49,6 +49,8 @@ Run `make help` at any time to see every supported command.
 8. Review the scanned rows, edit any cells, and add hours as needed. Rows start in ascending Date order; click any user-column header to sort by that column.
 9. Click **Check Invoice** to review possible duplicates, scan warnings, incomplete rows, and dates outside the invoice period. Check off advisory findings after verifying them; retry or fix operational scan failures.
 10. Use **Copy Full Invoice** (or **Copy N Selected**) for Google Sheets. Choose **Build PDF Output** for the client PDF and receipt package, or **Export Spreadsheet…** for a TSV/CSV package.
+11. Use **Save Backup…** to copy the complete saved invoice folder to a separate location. The app
+    creates a dated, non-overwriting folder and leaves the live invoice untouched.
 
 The saved API key is encrypted with Electron `safeStorage` before its ciphertext is written to the app's macOS Application Support directory. It is never written to the invoice folder, source tree, TSV/CSV files, or exports. Do not put API keys in this repository or in an `.env` file.
 
@@ -97,6 +99,8 @@ The saved API key is encrypted with Electron `safeStorage` before its ciphertext
 - Shows the managed receipt file path, source preview, itemization, validation warnings, and scan metadata on click.
 - Lets you pinch or use the preview controls to zoom images, then drag to pan around them.
 - Copies either the full invoice or selected rows as spreadsheet-ready TSV, and exports client/debug folders or ZIP files with bounded file I/O.
+- Saves a revision-checked, content-validated backup of the complete invoice folder to a separate
+  destination, using a dated name and numeric suffixes instead of overwriting an earlier backup.
 - Builds an invoice-local `output/invoice.pdf` plus one receipt copy per unique SHA-256 under `output/receipts/`.
 - **Check Invoice** detects exact receipt duplicates, warns about likely duplicate transactions, surfaces completed-scan validation warnings, and highlights incomplete rows or dates outside the invoice's inclusive range.
 - Lets the user mark advisory findings reviewed while keeping receipt scan status unchanged. The acknowledgment is tied to the exact causal evidence, so a materially changed row or a new scan must be reviewed again.

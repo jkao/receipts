@@ -173,6 +173,33 @@ function invoiceFolderName(period: InvoicePeriod): string {
   return `invoice-${period.startDate}-${period.endDate}`;
 }
 
+function isInsideOrEqual(candidate: string, root: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function canonicalOrdinaryDirectory(directory: string, label: string): Promise<string> {
+  const resolved = path.resolve(directory);
+  const metadata = await fs.lstat(resolved);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new InvoiceValidationError(`${label} must be an ordinary directory`);
+  }
+  return fs.realpath(resolved);
+}
+
+async function availableBackupFolder(
+  parent: string,
+  invoiceName: string,
+  dateStamp: string
+): Promise<string> {
+  const preferred = path.join(parent, `${invoiceName}-backup-${dateStamp}`);
+  if (!(await fileExists(preferred))) return preferred;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${preferred}-${suffix}`;
+    if (!(await fileExists(candidate))) return candidate;
+  }
+}
+
 function canonicalTimestamp(value: unknown, label: string): string {
   const timestamp = requiredString(value, label);
   const parsed = new Date(timestamp);
@@ -1339,6 +1366,73 @@ export class InvoiceStore {
         throw new RevisionConflictError(current.id, expectedRevision, current.revision);
       }
       return operation(cloneInvoiceDocument(current), folder);
+    });
+  }
+
+  async backupInvoice(
+    invoiceId: string,
+    destinationParent: string,
+    expectedRevision: number
+  ): Promise<string> {
+    safeInteger(expectedRevision, "Expected revision", 0);
+    const selectedParent = await canonicalOrdinaryDirectory(
+      destinationParent,
+      "Backup destination"
+    );
+    const liveBase = await fs.realpath(await this.baseFolder());
+    if (isInsideOrEqual(selectedParent, liveBase)) {
+      throw new InvoiceValidationError(
+        "Choose a backup destination outside the live invoice state folder"
+      );
+    }
+
+    return this.runAtRevision(invoiceId, expectedRevision, async (invoice, invoiceFolder) => {
+      const outputPath = await availableBackupFolder(
+        selectedParent,
+        invoice.name,
+        this.now().toISOString().slice(0, 10)
+      );
+      const stagedPath = path.join(
+        selectedParent,
+        `.${path.basename(outputPath)}.tmp-${randomUUID()}`
+      );
+      try {
+        await fs.cp(invoiceFolder, stagedPath, {
+          recursive: true,
+          errorOnExist: true,
+          force: false,
+          preserveTimestamps: true,
+          filter: async (source) => {
+            const metadata = await fs.lstat(source);
+            if (metadata.isSymbolicLink()) {
+              throw new InvoiceValidationError("Invoice backups cannot contain symbolic links");
+            }
+            if (!metadata.isDirectory() && !metadata.isFile()) {
+              throw new InvoiceValidationError(
+                "Invoice backups can contain only files and folders"
+              );
+            }
+            return true;
+          },
+        });
+
+        const copiedInvoice = validateInvoiceDocument(
+          JSON.parse(await fs.readFile(path.join(stagedPath, "invoice.json"), "utf8"))
+        );
+        if (
+          copiedInvoice.id !== invoice.id ||
+          copiedInvoice.revision !== invoice.revision ||
+          invoiceDocumentFingerprint(copiedInvoice) !== invoiceDocumentFingerprint(invoice)
+        ) {
+          throw new InvoiceValidationError("The copied invoice did not match the saved invoice");
+        }
+
+        await fs.rename(stagedPath, outputPath);
+        await syncDirectory(selectedParent);
+        return outputPath;
+      } finally {
+        await fs.rm(stagedPath, { recursive: true, force: true }).catch(() => undefined);
+      }
     });
   }
 
